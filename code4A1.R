@@ -3,6 +3,11 @@ library(terra)
 library(sf)
 library(spatstat) 
 library(mlr)
+library(dismo)
+library(maxnet)
+library(glmnet)
+library(precrec)
+
 #### function ####
 
 calc_prop_focal <- function(r, radius){
@@ -71,7 +76,33 @@ reclass_binary <- function(lcm, rule){
   return(result)
 }
 
-
+raster.as.im = function(im) {
+  # Get raster resolution (cell size)
+  r = raster::res(im)[1]
+  
+  # Get raster origin (lower-left corner coordinates)
+  orig = ext(im)[c(1,3)]
+  
+  # Construct x coordinates (column direction)
+  xx = orig[1] + seq(from = 0, to = (ncol(im) - 1) * 100, by = r)
+  
+  # Construct y coordinates (row direction)
+  yy = orig[2] + seq(from = 0, to = (nrow(im) - 1) * 100, by = r)
+  
+  # Create value matrix from raster
+  # - fill by row
+  # - flip vertically (because raster origin is bottom-left,
+  #   while spatstat expects top-left)
+  mat = matrix(raster::values(im),
+               ncol = ncol(im),
+               nrow = nrow(im),
+               byrow = TRUE)[nrow(im):1, ]
+  
+  # Convert to spatstat 'im' object
+  return(spatstat.geom::im(mat,
+                           xcol = xx,
+                           yrow = yy))
+}
 
 #### ----------------- 1 data processing ----------------- ####
 
@@ -102,6 +133,7 @@ demScot=rast('./data/demScotland.tif')
 ## check projection ----
 scot=st_transform(scot,crs(LCM))
 Melesmeles_sp = st_transform(Melesmeles_sp, crs(LCM))
+
 
 
 # 1.2 data processing ----
@@ -138,13 +170,16 @@ lcm_refuge_800  = calc_prop_focal(refuge, 800)
 
 demScot=terra::resample(demScot,lcm_forage_2000)
 
+
 #### ----------------- 2 create dataset -----------------  ####
 
 # 2.1 add all environment variables ----
 allEnv=c(lcm_forage_2000,lcm_disturb_2300,lcm_refuge_800,demScot)
 names(allEnv)=c('food','urban','habitat','dem')
 
+
 # 2.2 ‘presence’ and ‘background’ -----
+
 ## create the background points----
 set.seed(33)
 
@@ -180,6 +215,7 @@ Back.cov=st_as_sf(data.frame(back,Pres=0))
 
 
 # 2.3 merging data ----
+
 ## merging point coordinates ----
 # get coordinate
 coordsPres=st_coordinates(Pres.cov)
@@ -212,6 +248,7 @@ task = makeClassifTask(
   coordinates = task[,c("x","y")])
 
 
+
 # 3.2 Define the cross-validation strategy ----
 
 # Randomly shuffle all points, disregarding spatial location
@@ -227,4 +264,253 @@ perf_level_spCV = makeResampleDesc(
   method = "SpRepCV",
   folds = 5, 
   reps = 5) 
+
+
+
+
+####----------------- 4 Binomial ----------------- ####
+
+# 4.1 define Binomial (logistic regression) ----
+lrnBinomial = makeLearner(
+  "classif.binomial",      #Classification model of binomial distribution
+  predict.type = "prob",
+  fix.factors.prediction = TRUE)
+
+
+# 4.2 validation ----
+cvBinomial = resample(
+  learner = lrnBinomial,
+  task =task,
+  resampling = perf_levelCV, 
+  measures = mlr::auc,
+  show.info = FALSE)
+
+print(cvBinomial)
+
+sp_cvBinomial = resample(
+  learner = lrnBinomial,
+  task =task,
+  resampling = perf_level_spCV, 
+  measures = mlr::auc,
+  show.info = FALSE)
+
+print(sp_cvBinomial)
+
+
+# 4.3 make partition plots----
+
+plots = createSpatialResamplingPlots(
+  task,
+  resample=cvBinomial,
+  crs=crs(allEnv),
+  datum=crs(allEnv),
+  color.test = "red",
+  point.size = 1)
+
+plotsSP = createSpatialResamplingPlots(
+  task,
+  resample=sp_cvBinomial,
+  crs=crs(allEnv),
+  datum=crs(allEnv),
+  color.test = "red",
+  point.size = 1)
+
+plots = createSpatialResamplingPlots(
+  task,
+  resample=cvBinomial,
+  crs=crs(allEnv),
+  datum=crs(allEnv),
+  color.test = "red",
+  point.size = 1)
+
+library(cowplot)
+cowplot::plot_grid(plotlist = plots[["Plots"]], ncol = 3, nrow = 2,
+                   labels = plots[["Labels"]])
+
+
+
+####----------------- 5 Random Forest ----------------- ####
+
+# 5.1 define Random Forest ----
+lrnRF = makeLearner(
+  "classif.ranger",
+  predict.type = "prob",
+  fix.factors.prediction = TRUE)
+
+
+
+# 5.2 Random Forest validation----
+cvRF = resample(
+  learner = lrnRF,
+  task =task,
+  resampling = perf_levelCV, 
+  measures = mlr::auc,
+  show.info = FALSE)
+
+print(cvRF)
+
+sp_cvRF = resample(
+  learner = lrnRF, 
+  task =task,
+  resampling = perf_level_spCV, 
+  measures = mlr::auc,
+  show.info = FALSE)
+
+print(sp_cvRF)
+
+
+
+
+# 5.3 Random Forest Parameter Tuning----
+getParamSet(lrnRF)
+# Parameter tuning command
+paramsRF = makeParamSet(
+  makeIntegerParam("mtry",lower = 1,upper = 3),
+  makeIntegerParam("min.node.size",lower = 1,upper = 20),
+  makeIntegerParam("num.trees",lower = 100,upper = 500)
+)
+# Parameter Tuning Evaluation Method
+tune_level = makeResampleDesc(method = "SpCV", iters = 5)
+# Parameter search method
+ctrl = makeTuneControlRandom(maxit = 50)
+
+tuned_RF = tuneParams(learner = lrnRF,
+                      task = task,
+                      resampling = tune_level,
+                      measures = mlr::auc,
+                      par.set = paramsRF,
+                      control = ctrl,
+                      show.info = FALSE)
+
+print(tuned_RF)
+
+
+
+####----------------- 6 MaxEnt ----------------- ####
+
+# 6.1 spacial grid ----
+area_grid = st_make_grid(
+  MelesmelesFin,
+  c(50000, 50000),
+  what = "polygons",
+  square = T)
+
+area_grid_sf=st_as_sf(area_grid)
+area_grid_sf$grid_id=1:length(lengths(area_grid))
+
+# plot and check
+plot(area_grid_sf$x)
+plot(MelesmelesFin$geometry,add=T)
+
+# define spacial folds
+folds=area_grid_sf$grid_id
+
+# Unified coordinate system
+dataPoints=st_as_sf(all.cov,coords = c("x","y"))
+st_crs(dataPoints)=crs(area_grid_sf)
+
+# num for fold
+folds=5
+
+# presence and background
+### why do this ???
+Pres.cov=all.cov[all.cov$Pres==1,]
+Back.cov=all.cov[all.cov$Pres==0,]
+
+kfold_pres = kfold(Pres.cov, folds)
+kfold_back = kfold(Back.cov, folds)
+
+
+
+# 6.2 cross-validation ----
+# AUC list
+eMax=list()
+
+for (i in 1:folds) {
+  # get train and test data
+  train = Pres.cov[kfold_pres!= i,]
+  test = Pres.cov[kfold_pres == i,]
+  
+  backTrain=Back.cov[kfold_back!=i,]
+  backTest=Back.cov[kfold_back==i,]
+  
+  dataTrain=rbind(train,backTrain)
+  dataTest=rbind(test,backTest)
+  
+  # training
+  maxnetMod=maxnet(dataTrain$Pres, dataTrain[,1:4])
+  # evaluate on test data（AUC）
+  eMax[[i]] = evaluate(p=dataTest[ which(dataTest$Pres==1),],a=dataTest[which(dataTest$Pres==0),],maxnetMod)
+}
+
+# get all AUC
+aucMax = sapply(eMax, function(x){slot(x, 'auc')} )
+
+print(mean(aucMax))
+
+
+# 6.3 spatial cross-validation ----
+
+# Use grid IDs as folds for spatial partitioning
+folds = area_grid_sf$grid_id
+
+# Initialize list to store AUC results for each fold
+maxEvalList = list()
+
+for (i in folds) {
+  
+  # Define training area (all grids except the current one)
+  gridTrain = subset(area_grid_sf, area_grid_sf$grid_id != i)
+  
+  # Extract training points by spatial intersection with training grids
+  # and remove geometry to create a data frame
+  train = data.frame(
+    st_drop_geometry(
+      st_intersection(gridTrain, dataPoints)
+    )
+  )
+  
+  # Define test area (current grid only)
+  gridTest = subset(area_grid_sf, area_grid_sf$grid_id == i)
+  
+  # Extract test points within the test grid
+  test = data.frame(
+    st_drop_geometry(
+      st_intersection(gridTest, dataPoints)
+    )
+  )  
+  
+  # Train MaxEnt model (maxnet)
+  # train$Pres: presence/absence response
+  # train[1:4]: predictor variables
+  # classes = "lq": linear and quadratic features
+  maxnetMod = maxnet(train$Pres, train[1:4],
+                     classes = "lq")   
+  
+  # Predict on test data (cloglog scale gives occurrence probability)
+  pred = predict(maxnetMod, test, type = "cloglog")
+  
+  # Evaluate model performance (ROC and PR curves)
+  precrec_proc = evalmod(scores = pred,
+                         labels = test$Pres,
+                         mode = "prcroc")
+  
+  # Calculate AUC value
+  modauc = precrec::auc(
+    precrec::evalmod(scores = pred, 
+                     labels = test$Pres)
+  )
+  
+  # Store AUC of current fold
+  maxEvalList[[i]] = modauc$aucs[1]
+  
+  # Print current fold ID (progress tracking)
+  print(i)
+}
+
+# Compute mean AUC across all spatial folds
+mean(unlist(maxEvalList))
+
+
+
 
