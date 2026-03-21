@@ -278,7 +278,7 @@ lrnBinomial = makeLearner(
 
 
 # 4.2 validation ----
-cvBinomial = resample(
+cvBinomial = mlr::resample(
   learner = lrnBinomial,
   task =task,
   resampling = perf_levelCV, 
@@ -287,7 +287,7 @@ cvBinomial = resample(
 
 print(cvBinomial)
 
-sp_cvBinomial = resample(
+sp_cvBinomial = mlr::resample(
   learner = lrnBinomial,
   task =task,
   resampling = perf_level_spCV, 
@@ -329,6 +329,7 @@ cowplot::plot_grid(plotlist = plots[["Plots"]], ncol = 3, nrow = 2,
 
 
 
+
 ####----------------- 5 Random Forest ----------------- ####
 
 # 5.1 define Random Forest ----
@@ -338,9 +339,8 @@ lrnRF = makeLearner(
   fix.factors.prediction = TRUE)
 
 
-
 # 5.2 Random Forest validation----
-cvRF = resample(
+cvRF = mlr::resample(
   learner = lrnRF,
   task =task,
   resampling = perf_levelCV, 
@@ -349,7 +349,7 @@ cvRF = resample(
 
 print(cvRF)
 
-sp_cvRF = resample(
+sp_cvRF = mlr::resample(
   learner = lrnRF, 
   task =task,
   resampling = perf_level_spCV, 
@@ -386,8 +386,8 @@ print(tuned_RF)
 
 
 
-####----------------- 6 MaxEnt ----------------- ####
 
+####----------------- 6 MaxEnt ----------------- ####
 # 6.1 spacial grid ----
 area_grid = st_make_grid(
   MelesmelesFin,
@@ -419,7 +419,6 @@ Back.cov=all.cov[all.cov$Pres==0,]
 
 kfold_pres = kfold(Pres.cov, folds)
 kfold_back = kfold(Back.cov, folds)
-
 
 
 # 6.2 cross-validation ----
@@ -513,4 +512,165 @@ mean(unlist(maxEvalList))
 
 
 
+####----------------- 7 Point Process Modelling ----------------- ####
 
+# 7.1 Data preprocessing ----
+## Prepare environmental covariates ----
+
+# Convert raster layers to 'im' objects (required by spatstat)
+foodIm    = raster.as.im(raster(allEnv$food))     
+urbanIm   = raster.as.im(raster(allEnv$urban))
+habitatIm = raster.as.im(raster(allEnv$habitat))
+demIm     = raster.as.im(raster(allEnv$dem))  
+
+
+## Define study window ----
+# Create study window based on the urban raster layer
+window.poly = as.owin(urbanIm)
+
+# Inspect the study window
+plot(window.poly)
+
+
+## Create point pattern object ----
+
+# Extract coordinates from occurrence data (sf object)
+MelesmelesCoords = st_coordinates(MelesmelesFin)
+
+# Create point pattern (ppp object)
+pppMelesmeles = ppp(MelesmelesCoords[,1],
+                    MelesmelesCoords[,2],
+                    window = window.poly)
+
+# Visual check: raster layer + point pattern
+plot(allEnv$food)
+plot(pppMelesmeles, add = TRUE)
+
+# Remove points located outside the study window
+pppMelesmeles = as.ppp(pppMelesmeles)
+
+
+## Rescale spatial units ----
+
+# Convert units from meters to kilometers (to improve numerical stability)
+pppMelesmeles = spatstat.geom::rescale(pppMelesmeles, 1000)
+
+# Ensure all covariate rasters are on the same spatial scale
+foodIm    = spatstat.geom::rescale(foodIm, 1000)
+urbanIm   = spatstat.geom::rescale(urbanIm, 1000)
+habitatIm = spatstat.geom::rescale(habitatIm, 1000)
+demIm     = spatstat.geom::rescale(demIm, 1000)
+
+
+
+# 7.2 Exploratory analysis: test Complete Spatial Randomness (CSR)----
+
+# Compute Ripley’s K-function with simulation envelopes
+Kcsr = envelope(pppMelesmeles,
+                Kest,
+                nsim = 39,
+                VARIANCE = TRUE,
+                nSD = 1,
+                global = TRUE)
+
+# Plot results to assess deviation from CSR
+plot(Kcsr, shade = c("hi", "lo"), legend = TRUE)
+
+
+
+# 7.3 Select quadrature scheme (background point density)----
+
+# Test different grid densities for quadrature scheme
+ndTry = seq(100, 1000, by = 100)
+
+for(i in ndTry){
+  
+  # Construct quadrature scheme (data points + dummy/background points)
+  Q.i = quadscheme(pppMelesmeles,
+                   method = "grid",
+                   nd = i)
+  
+  # Fit a simple Poisson point process model
+  fit.i = ppm(Q.i ~ foodIm + urbanIm + demIm + habitatIm)
+  
+  print(i)
+  
+  # Evaluate model fit using AIC
+  print(AIC(fit.i))
+}
+
+# Select optimal grid density (based on AIC)
+Q = quadscheme(pppMelesmeles, method = "grid", nd = 900)
+
+
+
+# 7.4 Explore covariate-response relationships ----
+
+# Non-parametric estimation of intensity vs environmental covariates
+plot(rhohat(pppMelesmeles, foodIm))    
+plot(rhohat(pppMelesmeles, demIm))     
+plot(rhohat(pppMelesmeles, urbanIm))   
+plot(rhohat(pppMelesmeles, habitatIm))  
+
+
+
+# 7.5 Fit Poisson Point Process Model (PPM)----
+
+# Fit inhomogeneous Poisson point process model
+# Polynomial terms are used to capture non-linear relationships
+# Spatial coordinates (x, y) account for large-scale spatial trends
+firstPPMod = ppm(Q ~ poly(foodIm, 3) +
+                   poly(habitatIm, 3) +
+                   poly(demIm, 2) +
+                   poly(urbanIm, 3) +
+                   x + y)
+
+# Model diagnostics using simulation envelope of K-function
+firstModEnv = envelope(firstPPMod,
+                       Kest,
+                       nsim = 39,
+                       VARIANCE = TRUE,
+                       nSD = 1,
+                       global = TRUE)
+
+plot(firstModEnv)
+
+
+
+# 7.6 Fit cluster point process model (kppm - Thomas process)----
+
+# Fit Thomas cluster process model to account for spatial aggregation
+thomasMod = kppm(Q ~ poly(foodIm) +
+                   poly(habitatIm) +
+                   poly(urbanIm) +
+                   x + y,
+                 "Thomas")
+
+# Evaluate model fit using K-function envelope
+thomasEnv = envelope(thomasMod,
+                     Kest,
+                     nsim = 39,
+                     VARIANCE = TRUE,
+                     nSD = 1,
+                     global = TRUE)
+
+plot(thomasEnv)
+
+
+
+# 7.7 Model evaluation and spatial prediction ----
+
+# Plot ROC curve
+plot(roc(thomasMod))
+
+# Calculate AUC (model discrimination ability)
+auc.kppm(thomasMod)
+
+# Predict spatial intensity (occurrence probability surface)
+prPPMod = predict(thomasMod)
+
+# Visualize prediction
+plot(prPPMod)
+
+# Convert prediction to raster format for GIS visualization
+plot(rast(prPPMod))
