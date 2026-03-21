@@ -2,7 +2,7 @@ setwd("C:/Users/86153/Desktop/work4m/SE/ass1/14292476_A1")
 library(terra)
 library(sf)
 library(spatstat) 
-
+library(mlr)
 #### function ####
 
 calc_prop_focal <- function(r, radius){
@@ -71,6 +71,8 @@ reclass_binary <- function(lcm, rule){
   return(result)
 }
 
+
+
 #### ----------------- 1 data processing ----------------- ####
 
 # 1.1 read data ----
@@ -88,69 +90,75 @@ Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m < 5000, ]
 Melesmeles_latlong = data.frame( x = Melesmeles$Longitude, y = Melesmeles$Latitude )
 Melesmeles_sp = st_as_sf( Melesmeles_latlong, coords = c("x", "y"), crs = "epsg:4326")
 
-
-
-## England shapefile ----
-england = st_read('./data/England.shp')
+## scot shapefile ----
+scot=st_read('./data/scotSamp.shp')
 
 ## LCM raster (British National Grid) ----
 LCM=rast("./data/LCMUK.tif")
 
-## check projection ----
-england=st_transform(england,crs(LCM))
-Melesmeles_sp = st_transform(Melesmeles_sp, crs(LCM))
+## scotDEM ----
+demScot=rast('./data/demScotland.tif')
 
-# 1.2 data processing
+## check projection ----
+scot=st_transform(scot,crs(LCM))
+Melesmeles_sp = st_transform(Melesmeles_sp, crs(LCM))
 
 
 # 1.2 data processing ----
 ## LCM raster ----
-LCM=crop(LCM,st_buffer(england, dist= 1000))
+LCM=crop(LCM,st_buffer(scot, dist= 1000))
 LCM=aggregate(LCM$LCMUK_1,fact=4,fun="modal")
 # add why choose fact=4
 
 ## Cull data（england）----
-MelesmelesFin=Melesmeles_sp[england,]
-LCM=crop(LCM,england,mask=TRUE)
+MelesmelesFin=Melesmeles_sp[scot,]
+LCM=crop(LCM,scot,mask=TRUE)
 
 ## Calculate environment variables ----
-reclassLeaf  = c(0,1,rep(0,20))
-reclassUrban = c(rep(0,20),1,1) ## difference 19
+# Foraging resources
+reclassForage = c(0,1,0,1,1,rep(0,17))
+forage = reclass_binary(LCM, reclassForage)
 
-broadleaf = reclass_binary(LCM, reclassLeaf)
-urban = reclass_binary(LCM, reclassUrban)
+# Disturbance
+reclassDisturb = c(rep(0,20),1,1)
+disturb = reclass_binary(LCM, reclassDisturb)
 
-lcm_wood_1800  = calc_prop_focal(broadleaf, 1800)
-lcm_urban_2300 = calc_prop_focal(urban, 2300)
+# Refuge habitat
+reclassRefuge = c(0,1,1,rep(0,6),1,rep(0,12))
+refuge = reclass_binary(LCM, reclassRefuge)
+
+
+# --- Landscape proportion (moving window) ---
+
+lcm_forage_2000  = calc_prop_focal(forage, 2000)
+lcm_disturb_2300 = calc_prop_focal(disturb, 2300)
+lcm_refuge_800  = calc_prop_focal(refuge, 800)
 
 # add why choose 1800/2300
 
-# 
-
+demScot=terra::resample(demScot,lcm_forage_2000)
 
 #### ----------------- 2 create dataset -----------------  ####
 
 # 2.1 add all environment variables ----
-allEnv=c(lcm_wood_1800,lcm_urban_2300)
-names(allEnv)=c("broadleaf","urban")
-
-
+allEnv=c(lcm_forage_2000,lcm_disturb_2300,lcm_refuge_800,demScot)
+names(allEnv)=c('food','urban','habitat','dem')
 
 # 2.2 ‘presence’ and ‘background’ -----
 ## create the background points----
-set.seed(11)
+set.seed(33)
 
 back = spatSample(
-  allEnv,size=2000,
+  allEnv,size=3000,
   as.points=TRUE,
   method="random",
   na.rm=TRUE) 
 # add why choose 2000
 
-back=back[!is.na(back$broadleaf),]
+back=back[!is.na(back$food),]
+### ???
 
 back=st_as_sf(back,crs="EPSG:27700")
-
 
 ## organize ‘presence’ and ‘background’----
 
@@ -171,8 +179,7 @@ Pres.cov=Pres.cov[,-1]
 Back.cov=st_as_sf(data.frame(back,Pres=0))
 
 
-
-# 2.3 merging data
+# 2.3 merging data ----
 ## merging point coordinates ----
 # get coordinate
 coordsPres=st_coordinates(Pres.cov)
@@ -191,10 +198,33 @@ all.cov=na.omit(all.cov)
 all.cov=st_drop_geometry(all.cov)
 
 
+####----------------- 3 define parameters ----------------- ####
+
+# 3.1 Create category task ----
+task=all.cov
+
+task$Pres=as.factor(task$Pres)
+
+task = makeClassifTask(
+  data = task[,c('food','urban','habitat','dem',"Pres")],
+  target = "Pres",
+  positive = "1",
+  coordinates = task[,c("x","y")])
 
 
+# 3.2 Define the cross-validation strategy ----
 
-####-----------------  draw picture ----------------- ####
+# Randomly shuffle all points, disregarding spatial location
+perf_levelCV = makeResampleDesc(
+  method = "RepCV",
+  predict = "test",
+  folds = 5,
+  reps = 5)
 
-# figure 1 data show
-plot(st_geometry(MelesmelesFin), add=TRUE, col="red")
+# Training and test points are spatially separated.
+# Evaluate the model's predictive ability in "unsampled regions"
+perf_level_spCV = makeResampleDesc(
+  method = "SpRepCV",
+  folds = 5, 
+  reps = 5) 
+
