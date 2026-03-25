@@ -7,6 +7,7 @@ library(dismo)
 library(maxnet)
 library(glmnet)
 library(precrec)
+library(car)
 
 #### function ####
 
@@ -233,6 +234,10 @@ all.cov=cbind(all.cov,coords)
 all.cov=na.omit(all.cov)
 all.cov=st_drop_geometry(all.cov)
 
+# 2.4 VIF validation ----
+vif_data <- lm(food ~ dem + urban + habitat, data = all.cov)
+vif(vif_data)
+
 
 ####----------------- 3 define parameters ----------------- ####
 
@@ -330,6 +335,7 @@ cowplot::plot_grid(plotlist = plots[["Plots"]], ncol = 3, nrow = 2,
 
 
 
+
 ####----------------- 5 Random Forest ----------------- ####
 
 # 5.1 define Random Forest ----
@@ -365,7 +371,7 @@ print(sp_cvRF)
 getParamSet(lrnRF)
 # Parameter tuning command
 paramsRF = makeParamSet(
-  makeIntegerParam("mtry",lower = 1,upper = 3),
+  makeIntegerParam("mtry",lower = 1,upper = 4),
   makeIntegerParam("min.node.size",lower = 1,upper = 20),
   makeIntegerParam("num.trees",lower = 100,upper = 500)
 )
@@ -387,7 +393,9 @@ print(tuned_RF)
 
 
 
+
 ####----------------- 6 MaxEnt ----------------- ####
+
 # 6.1 spacial grid ----
 area_grid = st_make_grid(
   MelesmelesFin,
@@ -512,9 +520,84 @@ mean(unlist(maxEvalList))
 
 
 
-####----------------- 7 Point Process Modelling ----------------- ####
 
-# 7.1 Data preprocessing ----
+####----------------- 7. Ensemble Modeling (GLM + RF + MaxEnt) ----------------- ####
+
+### 7.1 Calculate Model Weights (Based on Spatial CV AUC) ----
+# Extract AUC from spatial cross-validation results
+auc_values <- c(
+  binomial = as.numeric(sp_cvBinomial$aggr),
+  rf       = as.numeric(sp_cvRF$aggr),
+  maxent   = mean(unlist(maxEvalList))
+)
+
+# Normalize weights so they sum to 1
+weights <- auc_values / sum(auc_values)
+print("Model Weights:")
+print(weights)
+
+### 7.2 Train Final Models using Full Dataset ----
+# 1. Logistic Regression (GLM)
+lrnBinomial <- makeLearner("classif.binomial", predict.type = "prob", fix.factors.prediction = TRUE)
+fit_glm <- mlr::train(lrnBinomial, task)
+
+# 2. Random Forest (RF)
+lrnRF <- makeLearner("classif.ranger", predict.type = "prob", fix.factors.prediction = TRUE)
+if(exists("tuned_RF")) lrnRF <- setHyperPars(lrnRF, par.vals = tuned_RF$x)
+fit_rf <- mlr::train(lrnRF, task)
+
+# 3. MaxEnt
+maxnet_data <- all.cov[, c("food", "urban", "habitat", "dem")]
+maxnet_pres <- all.cov$Pres
+fit_maxent  <- maxnet(maxnet_pres, maxnet_data, classes = "lq")
+
+### 7.3 Prepare Environmental Data for Prediction ----
+# Convert raster stack to data frame (keep NAs to maintain spatial structure)
+env_df_all <- as.data.frame(allEnv, xy = TRUE, na.rm = FALSE)
+pred_cols  <- c("food", "urban", "habitat", "dem")
+
+# Identify cells where all environmental variables have data (no NAs)
+final_mask <- complete.cases(env_df_all[, pred_cols])
+env_pred   <- env_df_all[final_mask, pred_cols]
+
+### 7.4 Generate Predictions ----
+# Predict probability for each model
+pred_glm    <- predict(fit_glm, newdata = env_pred)$data[, "prob.1"]
+pred_rf     <- predict(fit_rf, newdata = env_pred)$data[, "prob.1"]
+pred_maxent <- predict(fit_maxent, env_pred, type = "cloglog")
+
+### 7.5 Weighted Ensemble Calculation ----
+# Combine predictions using the AUC-based weights
+ensemble_vec <- (weights[1] * pred_glm) + 
+  (weights[2] * pred_rf) + 
+  (weights[3] * pred_maxent)
+
+### 7.6 Map Generation and Visualization ----
+# Create an empty raster template based on the original environment
+ensemble_raster <- rast(allEnv[[1]])
+values(ensemble_raster) <- NA
+
+# Fill the valid cells with ensemble prediction values
+ensemble_raster[which(final_mask)] <- ensemble_vec
+names(ensemble_raster) <- "Occurrence_Probability"
+setMinMax(ensemble_raster)
+
+# Final Plot
+plot(ensemble_raster, 
+     main = "Ensemble Suitability Map: Meles meles", 
+     col = terrain.colors(100))
+
+# Overlay presence points to verify accuracy
+points(MelesmelesFin, pch = 20, col = "red", cex = 0.5)
+
+# Save the final result
+writeRaster(ensemble_raster, "Ensemble_Suitability_Final.tif", overwrite = TRUE)
+
+
+
+####----------------- 8 Point Process Modelling ----------------- ####
+
+# 8.1 Data preprocessing ----
 ## Prepare environmental covariates ----
 
 # Convert raster layers to 'im' objects (required by spatstat)
@@ -563,7 +646,7 @@ demIm     = spatstat.geom::rescale(demIm, 1000)
 
 
 
-# 7.2 Exploratory analysis: test Complete Spatial Randomness (CSR)----
+# 8.2 Exploratory analysis: test Complete Spatial Randomness (CSR)----
 
 # Compute Ripley’s K-function with simulation envelopes
 Kcsr = envelope(pppMelesmeles,
@@ -578,7 +661,7 @@ plot(Kcsr, shade = c("hi", "lo"), legend = TRUE)
 
 
 
-# 7.3 Select quadrature scheme (background point density)----
+# 8.3 Select quadrature scheme (background point density)----
 
 # Test different grid densities for quadrature scheme
 ndTry = seq(100, 1000, by = 100)
@@ -604,7 +687,7 @@ Q = quadscheme(pppMelesmeles, method = "grid", nd = 900)
 
 
 
-# 7.4 Explore covariate-response relationships ----
+# 8.4 Explore covariate-response relationships ----
 
 # Non-parametric estimation of intensity vs environmental covariates
 plot(rhohat(pppMelesmeles, foodIm))    
@@ -613,8 +696,7 @@ plot(rhohat(pppMelesmeles, urbanIm))
 plot(rhohat(pppMelesmeles, habitatIm))  
 
 
-
-# 7.5 Fit Poisson Point Process Model (PPM)----
+# 8.5 Fit Poisson Point Process Model (PPM)----
 
 # Fit inhomogeneous Poisson point process model
 # Polynomial terms are used to capture non-linear relationships
@@ -637,7 +719,7 @@ plot(firstModEnv)
 
 
 
-# 7.6 Fit cluster point process model (kppm - Thomas process)----
+# 8.6 Fit cluster point process model (kppm - Thomas process)----
 
 # Fit Thomas cluster process model to account for spatial aggregation
 thomasMod = kppm(Q ~ poly(foodIm) +
@@ -658,7 +740,7 @@ plot(thomasEnv)
 
 
 
-# 7.7 Model evaluation and spatial prediction ----
+# 8.7 Model evaluation and spatial prediction ----
 
 # Plot ROC curve
 plot(roc(thomasMod))
