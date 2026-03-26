@@ -1,4 +1,7 @@
+#### ----------------- 0 Environment configuration ----------------- ####
+
 setwd("C:/Users/86153/Desktop/work4m/SE/ass1/14292476_A1")
+
 library(terra)
 library(sf)
 library(spatstat) 
@@ -105,6 +108,58 @@ raster.as.im = function(im) {
                            yrow = yy))
 }
 
+landBuffer <- function(speciesData, r, landcover){         
+  
+  pointsBuffer <- st_buffer(speciesData, dist = r)                     
+  
+  pointsBuffer_vect <- vect(pointsBuffer)
+  
+  bufferlandcover <- crop(landcover, pointsBuffer)              
+  
+  masklandcover <- extract(landcover, pointsBuffer_vect, weights = TRUE)      
+  
+  percentcover <- tapply(1:nrow(masklandcover), masklandcover[,1], function(i){
+    
+    df <- masklandcover[i,]
+    
+    cover_area <- sum(df$weight[df[,2] == 1], na.rm = TRUE)
+    
+    total_area <- sum(df$weight, na.rm = TRUE)
+    
+    return(cover_area / total_area * 100)
+  })
+  
+  return(percentcover)                                       
+}
+
+scale_optimization <- function(resList, radii, Pres){
+  
+  resFin <- do.call(cbind, resList)
+  glmData <- data.frame(resFin)
+  colnames(glmData) <- paste0("radius", radii)
+  glmData$Pres <- Pres
+  
+  glmRes <- data.frame(radius = radii, logLik = NA)
+  
+  for(i in seq_along(radii)){
+    
+    varname <- paste0("radius", radii[i])
+    
+    glm.i <- glm(glmData$Pres ~ glmData[[varname]],
+                 family = "binomial")
+    
+    glmRes$logLik[i] <- as.numeric(logLik(glm.i))
+  }
+  
+  opt <- glmRes[which.max(glmRes$logLik), ]
+  
+  return(list(
+    glmRes = glmRes,
+    optimal = opt,
+    data = glmData
+  ))
+}
+
 #### ----------------- 1 data processing ----------------- ####
 
 # 1.1 read data ----
@@ -114,13 +169,35 @@ Melesmeles = read.csv("./data/Melesmeles.csv")
 
 ## data clean
 Melesmeles<-Melesmeles[!is.na(Melesmeles$Latitude),]
-Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m < 5000, ]
 
-### !!! add discussion about 3000 
+# draw (Distribution of Coordinate Uncertainty)----
+unc <- Melesmeles$Coordinate.uncertainty_m
+breaks <- c(1000, 2000, 5000, 10000, Inf) 
+unc_cut <- cut(unc, breaks = breaks, right = FALSE)
+percent <- table(unc_cut) / length(unc) * 100
+percent_nonzero <- percent[percent > 0]
+
+barplot(percent_nonzero,
+        col = "#4C72B0",
+        border = NA,
+        main = "Distribution of Coordinate Uncertainty",
+        ylab = "Percentage (%)",
+        las = 1,
+        cex.names = 0.5)
+
+Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m == 1000, ]
 
 ## convert to spatial point
-Melesmeles_latlong = data.frame( x = Melesmeles$Longitude, y = Melesmeles$Latitude )
-Melesmeles_sp = st_as_sf( Melesmeles_latlong, coords = c("x", "y"), crs = "epsg:4326")
+Melesmeles_latlong = data.frame(
+  x = Melesmeles$Longitude, 
+  y = Melesmeles$Latitude )
+
+Melesmeles_sp = vect(
+  Melesmeles_latlong,
+  geom = c("x","y"),
+  crs = "EPSG:4326"  
+)
+
 
 ## scot shapefile ----
 scot=st_read('./data/scotSamp.shp')
@@ -131,10 +208,21 @@ LCM=rast("./data/LCMUK.tif")
 ## scotDEM ----
 demScot=rast('./data/demScotland.tif')
 
-## check projection ----
-scot=st_transform(scot,crs(LCM))
-Melesmeles_sp = st_transform(Melesmeles_sp, crs(LCM))
 
+## check projection and Cull data----
+scot=st_transform(scot,crs(LCM))
+scot_vect = vect(scot)
+Melesmeles_sp = project(Melesmeles_sp, "EPSG:27700")
+
+LCM = rast("./data/LCMUK.tif")
+LCM = LCM$LCMUK_1
+
+
+Melesmeles_crop <- crop(Melesmeles_sp, scot_vect)
+LCM <- crop(LCM, scot_vect)
+LCM <- mask(LCM, scot_vect)
+
+MelesmelesFin = project(Melesmeles_crop, crs(LCM))
 
 
 # 1.2 data processing ----
@@ -143,66 +231,269 @@ LCM=crop(LCM,st_buffer(scot, dist= 1000))
 LCM=aggregate(LCM$LCMUK_1,fact=4,fun="modal")
 # add why choose fact=4
 
-## Cull data（england）----
-MelesmelesFin=Melesmeles_sp[scot,]
-LCM=crop(LCM,scot,mask=TRUE)
-
-## Calculate environment variables ----
-# Foraging resources
-reclassForage = c(0,1,0,1,1,rep(0,17))
-forage = reclass_binary(LCM, reclassForage)
-
-# Disturbance
-reclassDisturb = c(rep(0,20),1,1)
-disturb = reclass_binary(LCM, reclassDisturb)
-
-# Refuge habitat
-reclassRefuge = c(0,1,1,rep(0,6),1,rep(0,12))
-refuge = reclass_binary(LCM, reclassRefuge)
-
-
-# --- Landscape proportion (moving window) ---
-
-lcm_forage_2000  = calc_prop_focal(forage, 2000)
-lcm_disturb_2300 = calc_prop_focal(disturb, 2300)
-lcm_refuge_800  = calc_prop_focal(refuge, 800)
-
-# add why choose 1800/2300
-
-demScot=terra::resample(demScot,lcm_forage_2000)
-
-
-#### ----------------- 2 create dataset -----------------  ####
-
-# 2.1 add all environment variables ----
-allEnv=c(lcm_forage_2000,lcm_disturb_2300,lcm_refuge_800,demScot)
-names(allEnv)=c('food','urban','habitat','dem')
-
-
-# 2.2 ‘presence’ and ‘background’ -----
-
 ## create the background points----
 set.seed(33)
 
 back = spatSample(
-  allEnv,size=3000,
+  LCM,size=1000,
   as.points=TRUE,
   method="random",
   na.rm=TRUE) 
-# add why choose 2000
 
-back=back[!is.na(back$food),]
-### ???
+# 1.3 choose feature ----
 
-back=st_as_sf(back,crs="EPSG:27700")
+# extract infor
+eA_1<-extract(LCM,back)
+eP_1<-extract(LCM,MelesmelesFin)
 
+# get frequency
+table(eA_1[,2])
+table(eP_1[,2])
+
+# calculate density
+hA <- hist(eA_1[,2], breaks = c(0:21), plot = FALSE)
+hP <- hist(eP_1[,2], breaks = c(0:21), plot = FALSE)
+
+# calculate difference
+diff_density <- hP$density - hA$density
+
+# draw ----
+bar_colors <- ifelse(diff_density > 0, "#2E8B57", "#A0522D")
+
+bp <- barplot(diff_density,
+              names.arg = 1:21,
+              ylim = c(-0.2, 0.3),
+              col = bar_colors,
+              border = NA,
+              space = 0.3,
+              main = "Density Difference (Presence vs Background)",
+              xlab = "Land Cover Class",
+              ylab = "Density Difference",
+              axes = FALSE)
+
+grid(nx = NA, ny = NULL, col = "lightgray", lty = "dotted")
+abline(v = bp, col = "lightgray", lty = "dotted")
+
+axis(2, las = 1, cex.axis = 0.9)
+abline(h = 0, lwd = 2, col = "gray40")
+
+legend("topright",
+       legend = c("Presence > Background", "Presence < Background"),
+       fill = c("#2E8B57", "#A0522D"),
+       bty = "n",
+       cex = 0.9)
+
+
+
+
+#### ----------------- 2 create dataset -----------------  ####
+
+Abs<-data.frame(crds(back),Pres=0)
+Pres<-data.frame(crds(MelesmelesFin),Pres=1)
+
+MelesmelesData<-rbind(Pres,Abs)
+MelesmelesData_sf=st_as_sf(MelesmelesData,coords=c("x","y"),crs="EPSG:27700")
+
+
+
+## 2.1 Calculate environment variables ----
+LCM<-as.factor(LCM)
+unique(LCM)
+
+# restricted area:Mountain, heath, bog
+reclassrestrict = c(rep(0,9),rep(1,4),rep(0,9))
+restrict = reclass_binary(LCM, reclassrestrict)
+
+# habitat
+reclasshabitat = c(0,1,1,rep(0,19))
+habitat = reclass_binary(LCM, reclasshabitat)
+
+# food
+reclassfood = c(rep(0,3),rep(1,2),rep(0,2),1,rep(0,14))
+food = reclass_binary(LCM, reclassfood)
+
+# urban
+reclassurban = c(rep(0,20),1,1)
+urban = reclass_binary(LCM, reclassurban)
+
+## 2.2 buffer ----
+
+# calculate different buffer
+radii<-seq(100,3000,by=200)
+resList=list()
+
+# habitat ----
+for(i in radii){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,habitat)
+  res.i
+  resList[[i/100]]=res.i
+  print(i)
+  gc()
+}
+
+result_habit <- scale_optimization(resList, radii, MelesmelesData$Pres)
+
+glmRes_habit <- result_habit$glmRes
+opt_habit <- result_habit$optimal
+
+# food ----
+for(i in radii){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,food)
+  res.i
+  resList[[i/100]]=res.i
+  print(i)
+  gc()
+}
+
+result_food <- scale_optimization(resList, radii, MelesmelesData$Pres)
+
+glmRes_food <- result_food$glmRes
+opt_food <- result_food$optimal
+
+# restrict ----
+for(i in radii){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,restrict)
+  res.i
+  resList[[i/100]]=res.i
+  print(i)
+  gc()
+}
+
+result_restrict <- scale_optimization(resList, radii, MelesmelesData$Pres)
+
+glmRes_restrict <- result_restrict$glmRes
+opt_restrict <- result_restrict$optimal
+
+print(opt_food,opt_habit,opt_restrict)
+
+par(mar = c(5,5,4,2))
+
+# draw habit ----
+plot(glmRes_habit$radius, glmRes_habit$logLik,
+     type = "b",
+     pch = 19,
+     lwd = 2,
+     col = "#D55E00",
+     cex = 1.2,
+     cex.axis = 1,
+     cex.lab = 1.2,
+     bty = "n",
+     main = "Habitat (栖息地)",
+     xlab = "Buffer size (m)",
+     ylab = "Log-likelihood")
+
+grid(col = "lightgray", lty = "dotted")
+opt_idx <- which.max(glmRes_habit$logLik)
+
+points(glmRes_habit$radius[opt_idx],
+       glmRes_habit$logLik[opt_idx],
+       pch = 19,
+       col = "blue",
+       cex = 1.5)
+
+text(glmRes_habit$radius[opt_idx],
+     glmRes_habit$logLik[opt_idx],
+     labels = paste0("Opt = ", glmRes_habit$radius[opt_idx]),
+     pos = 3,
+     col = "blue",
+     cex = 0.9)
+
+
+# draw food ----
+plot(glmRes_food$radius, glmRes_food$logLik,
+     type = "b",
+     pch = 19,
+     lwd = 2,
+     col = "#D55E00",
+     cex = 1.2,
+     cex.axis = 1,
+     cex.lab = 1.2,
+     bty = "n",
+     main = "food ()",
+     xlab = "Buffer size (m)",
+     ylab = "Log-likelihood")
+
+grid(col = "lightgray", lty = "dotted")
+opt_idx <- which.max(glmRes_food$logLik)
+
+points(glmRes_food$radius[opt_idx],
+       glmRes_food$logLik[opt_idx],
+       pch = 19,
+       col = "blue",
+       cex = 1.5)
+
+text(glmRes_food$radius[opt_idx],
+     glmRes_food$logLik[opt_idx],
+     labels = paste0("Opt = ", glmRes_food$radius[opt_idx]),
+     pos = 3,
+     col = "blue",
+     cex = 0.9)
+
+
+# draw restrict ----
+plot(glmRes_restrict$radius, glmRes_restrict$logLik,
+     type = "b",
+     pch = 19,
+     lwd = 2,
+     col = "#D55E00",
+     cex = 1.2,
+     cex.axis = 1,
+     cex.lab = 1.2,
+     bty = "n",
+     main = "restrict ()",
+     xlab = "Buffer size (m)",
+     ylab = "Log-likelihood")
+
+grid(col = "lightgray", lty = "dotted")
+opt_idx <- which.max(glmRes_restrict$logLik)
+
+points(glmRes_restrict$radius[opt_idx],
+       glmRes_restrict$logLik[opt_idx],
+       pch = 19,
+       col = "blue",
+       cex = 1.5)
+
+text(glmRes_restrict$radius[opt_idx],
+     glmRes_restrict$logLik[opt_idx],
+     labels = paste0("Opt = ", glmRes_restrict$radius[opt_idx]),
+     pos = 3,
+     col = "blue",
+     cex = 0.9)
+
+
+#urban
+dist_raster <- distance(urban, target = 0)
+dist_raster <- mask(dist_raster, urban)
+urban_dist <- exp(-dist_raster / 5000)
+
+#Landscape proportion (moving window) ----
+
+lcm_habit = calc_prop_focal(habitat, opt_habit$radius)
+lcm_food = calc_prop_focal(food, opt_food$radius)
+lcm_restrict  = calc_prop_focal(restrict, opt_restrict$radius)
+
+demScot=terra::resample(demScot,lcm_habit)
+
+# 2.1 add all environment variables ----
+allEnv=c(lcm_habit,lcm_food,lcm_restrict,urban_dist,demScot)
+names(allEnv)=c('habit','food','restrict','urban','dem')
+
+# 2.2 ‘presence’ and ‘background’ -----
+
+back_sf=st_as_sf(back,crs="EPSG:27700")
+Melesmeles_sf = st_as_sf(
+  MelesmelesFin,
+  coords = c("x", "y"),
+  crs="EPSG:27700"
+)
 ## organize ‘presence’ and ‘background’----
 
-# extract env var for presence point (MelesmelesFin)
-eP=terra::extract(allEnv,MelesmelesFin)
+# extract env var for presence point
+eP=terra::extract(allEnv,Melesmeles_sf)
+eB=terra::extract(allEnv,back_sf)
 # env var + presence point 
-Pres.cov=st_as_sf(cbind(eP,MelesmelesFin))
-
+Pres.cov=st_as_sf(cbind(eP,Melesmeles_sf))
+Back.cov=st_as_sf(cbind(eB,back_sf))
 
 ## add text for differencr point ----
 
@@ -212,20 +503,21 @@ Pres.cov$Pres=1
 Pres.cov=Pres.cov[,-1]
 
 # add text for background point
-Back.cov=st_as_sf(data.frame(back,Pres=0))
-
+Back.cov$Pres=0
+Back.cov = Back.cov[ , -c(1, 7)]
 
 # 2.3 merging data ----
 
 ## merging point coordinates ----
 # get coordinate
 coordsPres=st_coordinates(Pres.cov)
-coordsBack=st_coordinates(back)
+coordsBack=st_coordinates(back_sf)
 
 # merging point coordinates
 coords=data.frame(rbind(coordsPres,coordsBack))
 colnames(coords)=c("x","y")
-
+names(Pres.cov)
+names(Back.cov)
 all.cov=rbind(Pres.cov,Back.cov)
 all.cov=cbind(all.cov,coords)
 
@@ -234,23 +526,37 @@ all.cov=cbind(all.cov,coords)
 all.cov=na.omit(all.cov)
 all.cov=st_drop_geometry(all.cov)
 
+
 # 2.4 VIF validation ----
-vif_data <- lm(food ~ dem + urban + habitat, data = all.cov)
-vif(vif_data)
+
+vif_model <- lm(Pres ~ habit + food + restrict + urban + dem, data = all.cov)
+vif(vif_model)
+cor(all.cov[, c("habit", "food", "restrict", "urban", "dem")])
+str(all.cov)
+
+
+
+# PCA
+vars <- all.cov[, c("habit", "food", "restrict", "urban", "dem")]
+pca <- prcomp(vars, scale. = TRUE)
+
+pc_data <- as.data.frame(pca$x)
+
+pca$rotation
 
 
 ####----------------- 3 define parameters ----------------- ####
 
 # 3.1 Create category task ----
-task=all.cov
-
-task$Pres=as.factor(task$Pres)
+pc_data$Pres <- as.factor(all.cov$Pres)
+pc_data$x <- all.cov$x
+pc_data$y <- all.cov$y
 
 task = makeClassifTask(
-  data = task[,c('food','urban','habitat','dem',"Pres")],
+  data = pc_data[, c("PC1", "PC2", "PC3", "Pres")],
   target = "Pres",
   positive = "1",
-  coordinates = task[,c("x","y")])
+  coordinates = pc_data[, c("x", "y")])
 
 
 
@@ -269,7 +575,6 @@ perf_level_spCV = makeResampleDesc(
   method = "SpRepCV",
   folds = 5, 
   reps = 5) 
-
 
 
 
@@ -371,7 +676,7 @@ print(sp_cvRF)
 getParamSet(lrnRF)
 # Parameter tuning command
 paramsRF = makeParamSet(
-  makeIntegerParam("mtry",lower = 1,upper = 4),
+  makeIntegerParam("mtry",lower = 1,upper = 3),
   makeIntegerParam("min.node.size",lower = 1,upper = 20),
   makeIntegerParam("num.trees",lower = 100,upper = 500)
 )
@@ -408,7 +713,7 @@ area_grid_sf$grid_id=1:length(lengths(area_grid))
 
 # plot and check
 plot(area_grid_sf$x)
-plot(MelesmelesFin$geometry,add=T)
+plot(Melesmeles_sf$geometry,add=T)
 
 # define spacial folds
 folds=area_grid_sf$grid_id
@@ -547,18 +852,23 @@ if(exists("tuned_RF")) lrnRF <- setHyperPars(lrnRF, par.vals = tuned_RF$x)
 fit_rf <- mlr::train(lrnRF, task)
 
 # 3. MaxEnt
-maxnet_data <- all.cov[, c("food", "urban", "habitat", "dem")]
-maxnet_pres <- all.cov$Pres
+maxnet_data <- pc_data[, c("PC1", "PC2", "PC3")]
+maxnet_pres <- pc_data$Pres
 fit_maxent  <- maxnet(maxnet_pres, maxnet_data, classes = "lq")
 
 ### 7.3 Prepare Environmental Data for Prediction ----
-# Convert raster stack to data frame (keep NAs to maintain spatial structure)
-env_df_all <- as.data.frame(allEnv, xy = TRUE, na.rm = FALSE)
-pred_cols  <- c("food", "urban", "habitat", "dem")
 
-# Identify cells where all environmental variables have data (no NAs)
-final_mask <- complete.cases(env_df_all[, pred_cols])
-env_pred   <- env_df_all[final_mask, pred_cols]
+allPC <- terra::predict(allEnv, pca, index = 1:3)
+names(allPC) <- c("PC1", "PC2", "PC3")
+
+plot(allPC)
+
+# PC to Dataframe
+env_df_all <- as.data.frame(allPC, xy = TRUE, na.rm = FALSE)
+pred_vars <- c("PC1", "PC2", "PC3")
+
+final_mask <- complete.cases(env_df_all[, pred_vars])
+env_pred <- env_df_all[final_mask, pred_vars]
 
 ### 7.4 Generate Predictions ----
 # Predict probability for each model
@@ -592,7 +902,6 @@ points(MelesmelesFin, pch = 20, col = "red", cex = 0.5)
 
 # Save the final result
 writeRaster(ensemble_raster, "Ensemble_Suitability_Final.tif", overwrite = TRUE)
-
 
 
 ####----------------- 8 Point Process Modelling ----------------- ####
@@ -756,3 +1065,4 @@ plot(prPPMod)
 
 # Convert prediction to raster format for GIS visualization
 plot(rast(prPPMod))
+
