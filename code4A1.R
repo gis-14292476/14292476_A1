@@ -110,54 +110,62 @@ raster.as.im = function(im) {
 
 landBuffer <- function(speciesData, r, landcover){         
   
-  pointsBuffer <- st_buffer(speciesData, dist = r)                     
+  speciesBuffer <- st_buffer(speciesData, dist=r)                     
   
-  pointsBuffer_vect <- vect(pointsBuffer)
+  bufferlandcover <- crop(landcover, speciesBuffer)              
   
-  bufferlandcover <- crop(landcover, pointsBuffer)              
+  masklandcover <- extract(bufferlandcover, speciesBuffer,fun="sum")      
   
-  masklandcover <- extract(landcover, pointsBuffer_vect, weights = TRUE)      
+  landcoverArea <- masklandcover$LCMUK_1*625  
   
-  percentcover <- tapply(1:nrow(masklandcover), masklandcover[,1], function(i){
-    
-    df <- masklandcover[i,]
-    
-    cover_area <- sum(df$weight[df[,2] == 1], na.rm = TRUE)
-    
-    total_area <- sum(df$weight, na.rm = TRUE)
-    
-    return(cover_area / total_area * 100)
-  })
+  percentcover <- landcoverArea/as.numeric(st_area(speciesBuffer))*100 
   
   return(percentcover)                                       
 }
 
-scale_optimization <- function(resList, radii, Pres){
+Test_GLM <- function(resList,speciesData,radii){
+  # list to dataframe
+  resFin=do.call("cbind",resList)
+  glmData=data.frame(resFin)
+  #intuitive column names
+  colnames(glmData)=paste("radius",radii,sep="")
+  #add in the presences data
+  glmData$Pres<-speciesData$Pres
   
-  resFin <- do.call(cbind, resList)
-  glmData <- data.frame(resFin)
-  colnames(glmData) <- paste0("radius", radii)
-  glmData$Pres <- Pres
+  glmRes=data.frame(radius=NA,loglikelihood=NA)
   
-  glmRes <- data.frame(radius = radii, logLik = NA)
-  
-  for(i in seq_along(radii)){
+  for(i in radii){
     
-    varname <- paste0("radius", radii[i])
+    #build the model formula with format "response variable ~ explanatory variable, family, data"
+    #Here "binomial" is the error distribution normally used for a binary outcome (e.g. 0, 1) 
+    n.i=paste0("Pres~","radius",i,sep ="")
     
-    glm.i <- glm(glmData$Pres ~ glmData[[varname]],
-                 family = "binomial")
+    glm.i=glm(formula(n.i),family = "binomial",data = glmData)
     
-    glmRes$logLik[i] <- as.numeric(logLik(glm.i))
+    ll.i=as.numeric(logLik(glm.i))
+    
+    glmRes=rbind(glmRes,c(i,ll.i))
   }
+  return(glmRes)
+}
+
+reclass_binary <- function(lcm, rule){
   
-  opt <- glmRes[which.max(glmRes$logLik), ]
+  # transformation
+  lcm = as.factor(lcm$LCMUK_1)
   
-  return(list(
-    glmRes = glmRes,
-    optimal = opt,
-    data = glmData
-  ))
+  # create reclass matrix
+  RCmatrix = cbind(levels(lcm)[[1]], rule)
+  
+  # old class + new class
+  RCmatrix = RCmatrix[,2:3]
+  
+  # to numeric
+  RCmatrix = apply(RCmatrix, 2, as.numeric)
+  
+  result = classify(lcm, RCmatrix)
+  
+  return(result)
 }
 
 #### ----------------- 1 data processing ----------------- ####
@@ -185,13 +193,13 @@ barplot(percent_nonzero,
         las = 1,
         cex.names = 0.5)
 
-Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m == 1000, ]
+Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m <= 1000, ]
 
-## convert to spatial point
+# coord_dataframe
 Melesmeles_latlong = data.frame(
   x = Melesmeles$Longitude, 
   y = Melesmeles$Latitude )
-
+# point object
 Melesmeles_sp = vect(
   Melesmeles_latlong,
   geom = c("x","y"),
@@ -211,34 +219,37 @@ demScot=rast('./data/demScotland.tif')
 
 ## check projection and Cull data----
 scot=st_transform(scot,crs(LCM))
-scot_vect = vect(scot)
-Melesmeles_sp = project(Melesmeles_sp, "EPSG:27700")
+studyExtent <- aggregate(vect(scot))
 
-LCM = rast("./data/LCMUK.tif")
-LCM = LCM$LCMUK_1
-
-
-Melesmeles_crop <- crop(Melesmeles_sp, scot_vect)
-LCM <- crop(LCM, scot_vect)
-LCM <- mask(LCM, scot_vect)
-
-MelesmelesFin = project(Melesmeles_crop, crs(LCM))
-
+Melesmeles_sp<-project(Melesmeles_sp,crs(LCM))
+MelesmelesFin<-crop(Melesmeles_sp,studyExtent)
 
 # 1.2 data processing ----
 ## LCM raster ----
-LCM=crop(LCM,st_buffer(scot, dist= 1000))
-LCM=aggregate(LCM$LCMUK_1,fact=4,fun="modal")
+LCM = LCM$LCMUK_1
+# get coords
+coords <- crds(MelesmelesFin)
+# buffer
+studyExtent_buffer <- ext(min(coords[,1]) - 5000,max(coords[,1]) + 5000,min(coords[,2]) - 5000,max(coords[,2]) + 5000)
+
+LCM <- crop(LCM, studyExtent_buffer)
+
+LCM=aggregate(LCM,fact=4,fun="modal")
 # add why choose fact=4
 
 ## create the background points----
-set.seed(33)
+set.seed(11)
 
 back = spatSample(
-  LCM,size=1000,
-  as.points=TRUE,
-  method="random",
-  na.rm=TRUE) 
+  studyExtent,
+  size=2500,
+  method="random") 
+
+plot(LCM)                          # 先画底图（栅格）
+plot(scot,col='white', add=TRUE)
+plot(back, add=TRUE, col="blue", pch=16, cex=0.5)   # 再画背景点
+plot(MelesmelesFin, add=TRUE, col="red", pch=16, cex=0.5) # 最后画出现点
+
 
 # 1.3 choose feature ----
 
@@ -294,189 +305,155 @@ Pres<-data.frame(crds(MelesmelesFin),Pres=1)
 MelesmelesData<-rbind(Pres,Abs)
 MelesmelesData_sf=st_as_sf(MelesmelesData,coords=c("x","y"),crs="EPSG:27700")
 
-
-
 ## 2.1 Calculate environment variables ----
 LCM<-as.factor(LCM)
-unique(LCM)
 
 # restricted area:Mountain, heath, bog
 reclassrestrict = c(rep(0,9),rep(1,4),rep(0,9))
 restrict = reclass_binary(LCM, reclassrestrict)
 
-# habitat
-reclasshabitat = c(0,1,1,rep(0,19))
-habitat = reclass_binary(LCM, reclasshabitat)
+# Broadleaved
+reclassBroadleaved = c(0,1,rep(0,20))
+Broadleaved = reclass_binary(LCM, reclassBroadleaved)
+plot(Broadleaved)
 
-# food
-reclassfood = c(rep(0,3),rep(1,2),rep(0,2),1,rep(0,14))
-food = reclass_binary(LCM, reclassfood)
+# Coniferouswoodland
+reclassConiferous = c(0,0,1,rep(0,19))
+Coniferous = reclass_binary(LCM, reclassConiferous)
+plot(Coniferous)
 
-# urban
-reclassurban = c(rep(0,20),1,1)
-urban = reclass_binary(LCM, reclassurban)
+# Arable and horticulture
+reclassArable = c(rep(0,3),1,rep(0,18))
+Arable = reclass_binary(LCM, reclassArable)
+
+# Improved grassland
+reclassImpgrass = c(rep(0,4),1,rep(0,17))
+Impgrass = reclass_binary(LCM, reclassImpgrass)
+
+# Acid grassland
+reclassAcidgrass = c(rep(0,7),1,rep(0,14))
+Acidgrass = reclass_binary(LCM, reclassAcidgrass)
+
 
 ## 2.2 buffer ----
 
-# calculate different buffer
-radii<-seq(100,3000,by=200)
-resList=list()
+# Broadleaved# ----
+radii_Broadleaved<-seq(300,3000,by=300)
+resList_Broadleaved=list()
 
-# habitat ----
-for(i in radii){
-  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,habitat)
-  res.i
-  resList[[i/100]]=res.i
+for(i in radii_Broadleaved){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=Broadleaved)
+  resList_Broadleaved[[i/200]]=res.i
   print(i)
-  gc()
 }
+glmRes_Broadleaved <- Test_GLM(
+  resList = resList_Broadleaved,
+  speciesData = MelesmelesData,
+  radii = radii_Broadleaved
+)
+plot(glmRes_Broadleaved$radius, glmRes_Broadleaved$loglikelihood, type = "b", frame = FALSE, pch = 19, 
+     col = "red", xlab = "buffer", ylab = "logLik")
+glmRes_Broadleaved
 
-result_habit <- scale_optimization(resList, radii, MelesmelesData$Pres)
 
-glmRes_habit <- result_habit$glmRes
-opt_habit <- result_habit$optimal
+# Arable and horticulture ----
+radii_Arable<-seq(500,2000,by=100)
+resList_Arable=list()
 
-# food ----
-for(i in radii){
-  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,food)
-  res.i
-  resList[[i/100]]=res.i
+for(i in radii_Arable){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=Arable)
+  resList_Arable[[i/100]]=res.i
   print(i)
-  gc()
 }
+glmRes_Arable <- Test_GLM(
+  resList = resList_Arable,
+  speciesData = MelesmelesData,
+  radii = radii_Arable
+)
+plot(glmRes_Arable$radius, glmRes_Arable$loglikelihood, type = "b", frame = FALSE, pch = 19, 
+     col = "red", xlab = "buffer", ylab = "logLik")
+glmRes_Arable
 
-result_food <- scale_optimization(resList, radii, MelesmelesData$Pres)
 
-glmRes_food <- result_food$glmRes
-opt_food <- result_food$optimal
+# Improved grassland# ----
+radii_Impgrass<-seq(200,1800,by=100)
+resList_Impgrass=list()
 
-# restrict ----
-for(i in radii){
-  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,restrict)
-  res.i
-  resList[[i/100]]=res.i
+for(i in radii_Impgrass){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=Impgrass)
+  resList_Impgrass[[i/100]]=res.i
   print(i)
-  gc()
 }
-
-result_restrict <- scale_optimization(resList, radii, MelesmelesData$Pres)
-
-glmRes_restrict <- result_restrict$glmRes
-opt_restrict <- result_restrict$optimal
-
-print(opt_food,opt_habit,opt_restrict)
-
-par(mar = c(5,5,4,2))
-
-# draw habit ----
-plot(glmRes_habit$radius, glmRes_habit$logLik,
-     type = "b",
-     pch = 19,
-     lwd = 2,
-     col = "#D55E00",
-     cex = 1.2,
-     cex.axis = 1,
-     cex.lab = 1.2,
-     bty = "n",
-     main = "Habitat (栖息地)",
-     xlab = "Buffer size (m)",
-     ylab = "Log-likelihood")
-
-grid(col = "lightgray", lty = "dotted")
-opt_idx <- which.max(glmRes_habit$logLik)
-
-points(glmRes_habit$radius[opt_idx],
-       glmRes_habit$logLik[opt_idx],
-       pch = 19,
-       col = "blue",
-       cex = 1.5)
-
-text(glmRes_habit$radius[opt_idx],
-     glmRes_habit$logLik[opt_idx],
-     labels = paste0("Opt = ", glmRes_habit$radius[opt_idx]),
-     pos = 3,
-     col = "blue",
-     cex = 0.9)
+glmRes_Impgrass <- Test_GLM(
+  resList = resList_Impgrass,
+  speciesData = MelesmelesData,
+  radii = radii_Impgrass
+)
+plot(glmRes_Impgrass$radius, glmRes_Impgrass$loglikelihood, type = "b", frame = FALSE, pch = 19, 
+     col = "red", xlab = "buffer", ylab = "logLik")
+glmRes_Impgrass
 
 
-# draw food ----
-plot(glmRes_food$radius, glmRes_food$logLik,
-     type = "b",
-     pch = 19,
-     lwd = 2,
-     col = "#D55E00",
-     cex = 1.2,
-     cex.axis = 1,
-     cex.lab = 1.2,
-     bty = "n",
-     main = "food ()",
-     xlab = "Buffer size (m)",
-     ylab = "Log-likelihood")
+# Acid grassland# ----
+radii_Acidgrass<-seq(400,2400,by=200)
+resList_Acidgrass=list()
 
-grid(col = "lightgray", lty = "dotted")
-opt_idx <- which.max(glmRes_food$logLik)
-
-points(glmRes_food$radius[opt_idx],
-       glmRes_food$logLik[opt_idx],
-       pch = 19,
-       col = "blue",
-       cex = 1.5)
-
-text(glmRes_food$radius[opt_idx],
-     glmRes_food$logLik[opt_idx],
-     labels = paste0("Opt = ", glmRes_food$radius[opt_idx]),
-     pos = 3,
-     col = "blue",
-     cex = 0.9)
+for(i in radii_Acidgrass){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=Acidgrass)
+  resList_Acidgrass[[i/200]]=res.i
+  print(i)
+}
+glmRes_Acidgrass <- Test_GLM(
+  resList = resList_Acidgrass,
+  speciesData = MelesmelesData,
+  radii = radii_Acidgrass
+)
+plot(glmRes_Acidgrass$radius, glmRes_Acidgrass$loglikelihood, type = "b", frame = FALSE, pch = 19, 
+     col = "red", xlab = "buffer", ylab = "logLik")
+glmRes_Acidgrass
 
 
-# draw restrict ----
-plot(glmRes_restrict$radius, glmRes_restrict$logLik,
-     type = "b",
-     pch = 19,
-     lwd = 2,
-     col = "#D55E00",
-     cex = 1.2,
-     cex.axis = 1,
-     cex.lab = 1.2,
-     bty = "n",
-     main = "restrict ()",
-     xlab = "Buffer size (m)",
-     ylab = "Log-likelihood")
+# restrict# ----
+radii_restrict<-seq(100,1500,by=100)
+resList_restrict=list()
 
-grid(col = "lightgray", lty = "dotted")
-opt_idx <- which.max(glmRes_restrict$logLik)
-
-points(glmRes_restrict$radius[opt_idx],
-       glmRes_restrict$logLik[opt_idx],
-       pch = 19,
-       col = "blue",
-       cex = 1.5)
-
-text(glmRes_restrict$radius[opt_idx],
-     glmRes_restrict$logLik[opt_idx],
-     labels = paste0("Opt = ", glmRes_restrict$radius[opt_idx]),
-     pos = 3,
-     col = "blue",
-     cex = 0.9)
-
-
-#urban
-dist_raster <- distance(urban, target = 0)
-dist_raster <- mask(dist_raster, urban)
-urban_dist <- exp(-dist_raster / 5000)
+for(i in radii_restrict){
+  res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=restrict)
+  resList_restrict[[i/100]]=res.i
+  print(i)
+}
+glmRes_restrict <- Test_GLM(
+  resList = resList_restrict,
+  speciesData = MelesmelesData,
+  radii = radii_restrict
+)
+plot(glmRes_restrict$radius, glmRes_restrict$loglikelihood, type = "b", frame = FALSE, pch = 19, 
+     col = "red", xlab = "buffer", ylab = "logLik")
 
 #Landscape proportion (moving window) ----
 
-lcm_habit = calc_prop_focal(habitat, opt_habit$radius)
-lcm_food = calc_prop_focal(food, opt_food$radius)
-lcm_restrict  = calc_prop_focal(restrict, opt_restrict$radius)
 
-demScot=terra::resample(demScot,lcm_habit)
+lcm_restrict  = calc_prop_focal(restrict, glmRes_restrict$radius[which.max(glmRes_restrict$loglikelihood)])
+lcm_Acidgrass  = calc_prop_focal(Acidgrass, glmRes_Acidgrass$radius[which.max(glmRes_Acidgrass$loglikelihood)])
+lcm_Impgrass  = calc_prop_focal(Impgrass, glmRes_Impgrass$radius[which.max(glmRes_Impgrass$loglikelihood)])
+lcm_Broadleaved  = calc_prop_focal(Broadleaved, glmRes_Broadleaved$radius[which.max(glmRes_Broadleaved$loglikelihood)])
+
+glmRes_restrict$radius[which.max(glmRes_restrict$loglikelihood)]
+glmRes_Acidgrass$radius[which.max(glmRes_Acidgrass$loglikelihood)]
+glmRes_Impgrass$radius[which.max(glmRes_Impgrass$loglikelihood)]
+glmRes_Broadleaved$radius[which.max(glmRes_Broadleaved$loglikelihood)]
+
+#Arable
+dist_raster <- distance(Arable, target = 0)
+dist_raster <- mask(dist_raster, Arable)
+Arable_dist <- exp(-dist_raster / 5000)
+plot(Arable_dist)
+
+demScot=terra::resample(demScot,lcm_restrict)
 
 # 2.1 add all environment variables ----
-allEnv=c(lcm_habit,lcm_food,lcm_restrict,urban_dist,demScot)
-names(allEnv)=c('habit','food','restrict','urban','dem')
+allEnv=c(lcm_Acidgrass,lcm_Impgrass,lcm_restrict,lcm_Broadleaved,Arable_dist,demScot)
+names(allEnv)=c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')
 
 # 2.2 ‘presence’ and ‘background’ -----
 
@@ -504,7 +481,7 @@ Pres.cov=Pres.cov[,-1]
 
 # add text for background point
 Back.cov$Pres=0
-Back.cov = Back.cov[ , -c(1, 7)]
+Back.cov = Back.cov[,-1]
 
 # 2.3 merging data ----
 
@@ -529,21 +506,20 @@ all.cov=st_drop_geometry(all.cov)
 
 # 2.4 VIF validation ----
 
-vif_model <- lm(Pres ~ habit + food + restrict + urban + dem, data = all.cov)
+vif_model <- lm(Pres ~ Acidgrass + Impgrass + restrict + Broadleaved + Arable + dem, data = all.cov)
 vif(vif_model)
-cor(all.cov[, c("habit", "food", "restrict", "urban", "dem")])
+cor(all.cov[, c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')])
 str(all.cov)
 
 
-
 # PCA
-vars <- all.cov[, c("habit", "food", "restrict", "urban", "dem")]
+vars <- all.cov[, c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')]
 pca <- prcomp(vars, scale. = TRUE)
 
 pc_data <- as.data.frame(pca$x)
 
 pca$rotation
-
+summary(pca)
 
 ####----------------- 3 define parameters ----------------- ####
 
@@ -553,12 +529,10 @@ pc_data$x <- all.cov$x
 pc_data$y <- all.cov$y
 
 task = makeClassifTask(
-  data = pc_data[, c("PC1", "PC2", "PC3", "Pres")],
+  data = pc_data[, c("PC1", "PC2", "PC3","Pres")],
   target = "Pres",
   positive = "1",
   coordinates = pc_data[, c("x", "y")])
-
-
 
 # 3.2 Define the cross-validation strategy ----
 
@@ -602,7 +576,35 @@ sp_cvBinomial = mlr::resample(
   task =task,
   resampling = perf_level_spCV, 
   measures = mlr::auc,
-  show.info = FALSE)
+  models = TRUE,
+  keep.pred = TRUE)
+pred <- sp_cvBinomial$pred
+e <- evaluate(pred$data$prob.1[pred$data$truth == 1],
+              pred$data$prob.1[pred$data$truth == 0])
+
+print(sp_cvBinomial)
+plot(e, "ROC")
+
+sp_cvBinomial = mlr::resample(
+  learner = lrnBinomial,
+  task =task,
+  resampling = perf_level_spCV, 
+  measures = mlr::auc,
+  models = TRUE,
+  keep.pred = TRUE)
+pred <- sp_cvBinomial$pred
+e <- evaluate(pred$data$prob.1[pred$data$truth == 1],
+              pred$data$prob.1[pred$data$truth == 0])
+
+print(sp_cvBinomial)
+plot(e, "ROC")
+
+roc_obj <- roc(
+  response = pred$data$truth,
+  predictor = pred$data$prob.1   # 注意类别名称
+)
+
+plot(roc_obj, col = "blue", lwd = 2)
 
 print(sp_cvBinomial)
 
@@ -694,8 +696,6 @@ tuned_RF = tuneParams(learner = lrnRF,
                       show.info = FALSE)
 
 print(tuned_RF)
-
-
 
 
 
@@ -852,10 +852,11 @@ if(exists("tuned_RF")) lrnRF <- setHyperPars(lrnRF, par.vals = tuned_RF$x)
 fit_rf <- mlr::train(lrnRF, task)
 
 # 3. MaxEnt
+pc_data$Pres <- as.numeric(as.character(pc_data$Pres))
 maxnet_data <- pc_data[, c("PC1", "PC2", "PC3")]
 maxnet_pres <- pc_data$Pres
 fit_maxent  <- maxnet(maxnet_pres, maxnet_data, classes = "lq")
-
+unique(pc_data$Pres)
 ### 7.3 Prepare Environmental Data for Prediction ----
 
 allPC <- terra::predict(allEnv, pca, index = 1:3)
@@ -899,9 +900,6 @@ plot(ensemble_raster,
 
 # Overlay presence points to verify accuracy
 points(MelesmelesFin, pch = 20, col = "red", cex = 0.5)
-
-# Save the final result
-writeRaster(ensemble_raster, "Ensemble_Suitability_Final.tif", overwrite = TRUE)
 
 
 ####----------------- 8 Point Process Modelling ----------------- ####
