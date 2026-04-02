@@ -11,8 +11,54 @@ library(maxnet)
 library(glmnet)
 library(precrec)
 library(car)
+library(ranger)
+library(gstat)
+library(sp)
+library(raster)
+
+set.seed(23)
 
 #### function ####
+create_dataset <- function(raster, var_names,presence_pts, background_pts){
+  Env =c(raster)
+  names(Env)=var_names
+  
+  # ‘presence’ and ‘background’ 
+  back_sf=st_as_sf(background_pts,crs="EPSG:27700")
+  presence_sf = st_as_sf(presence_pts,coords = c("x", "y"),crs="EPSG:27700")
+  
+  # extract env var for presence point ----
+  e4P=terra::extract(Env,presence_sf)
+  e4B=terra::extract(Env,back_sf)
+  
+  # env var + presence point 
+  Pres.cov=st_as_sf(cbind(e4P,presence_sf))
+  Back.cov=st_as_sf(cbind(e4B,back_sf))
+  
+  # add text for differencr point 
+  Pres.cov$Pres=1
+  Pres.cov=Pres.cov[,-1]
+  
+  Back.cov$Pres=0
+  Back.cov = Back.cov[,-1]
+  
+  
+  # merging point coordinates
+  coordsPres=st_coordinates(Pres.cov)
+  coordsBack=st_coordinates(back_sf)
+  
+  coords=data.frame(rbind(coordsPres,coordsBack))
+  colnames(coords)=c("x","y")
+  
+  all.cov=rbind(Pres.cov,Back.cov)
+  all.cov=cbind(all.cov,coords)
+  
+  
+  # data cleaning
+  all.cov=na.omit(all.cov)
+  all.cov=st_drop_geometry(all.cov)
+  
+  return(all.cov)}
 
 calc_prop_focal <- function(r, radius){
   
@@ -122,7 +168,6 @@ landBuffer <- function(speciesData, r, landcover){
   
   return(percentcover)                                       
 }
-
 Test_GLM <- function(resList,speciesData,radii){
   # list to dataframe
   resFin=do.call("cbind",resList)
@@ -148,7 +193,6 @@ Test_GLM <- function(resList,speciesData,radii){
   }
   return(glmRes)
 }
-
 reclass_binary <- function(lcm, rule){
   
   # transformation
@@ -170,14 +214,15 @@ reclass_binary <- function(lcm, rule){
 
 #### ----------------- 1 data processing ----------------- ####
 
-# 1.1 read data ----
-## Melesmeles spatial point data （British National Grid）----
+# 1.1 read data
 
 Melesmeles = read.csv("./data/Melesmeles.csv")
+scot=st_read('./data/scotSamp.shp')
+LCM=rast("./data/LCMUK.tif")
+demScot=rast('./data/demScotland.tif')
 
 ## data clean
 Melesmeles<-Melesmeles[!is.na(Melesmeles$Latitude),]
-
 # draw (Distribution of Coordinate Uncertainty)----
 unc <- Melesmeles$Coordinate.uncertainty_m
 breaks <- c(1000, 2000, 5000, 10000, Inf) 
@@ -195,67 +240,75 @@ barplot(percent_nonzero,
 
 Melesmeles = Melesmeles[Melesmeles$Coordinate.uncertainty_m <= 1000, ]
 
-# coord_dataframe
-Melesmeles_latlong = data.frame(
-  x = Melesmeles$Longitude, 
-  y = Melesmeles$Latitude )
+
+# chlip----
+# Melesmeles coord_dataframe ----
+Melesmeles_latlong = data.frame(x = Melesmeles$Longitude, 
+                                y = Melesmeles$Latitude )
 # point object
-Melesmeles_sp = vect(
-  Melesmeles_latlong,
-  geom = c("x","y"),
-  crs = "EPSG:4326"  
-)
+Melesmeles_sp = vect( Melesmeles_latlong, geom = c("x","y"), crs = "EPSG:4326")
 
-
-## scot shapefile ----
-scot=st_read('./data/scotSamp.shp')
-
-## LCM raster (British National Grid) ----
-LCM=rast("./data/LCMUK.tif")
-
-## scotDEM ----
-demScot=rast('./data/demScotland.tif')
-
-
-## check projection and Cull data----
+Melesmeles_proj<-project(Melesmeles_sp,crs(LCM))
 scot=st_transform(scot,crs(LCM))
-studyExtent <- aggregate(vect(scot))
+studyExtent = vect(st_union(scot))
 
-Melesmeles_sp<-project(Melesmeles_sp,crs(LCM))
-MelesmelesFin<-crop(Melesmeles_sp,studyExtent)
+Melesmeles_sp <-crop(Melesmeles_proj,studyExtent)
 
-# 1.2 data processing ----
+plot(Melesmeles_sp)
+
 ## LCM raster ----
 LCM = LCM$LCMUK_1
-# get coords
-coords <- crds(MelesmelesFin)
-# buffer
-studyExtent_buffer <- ext(min(coords[,1]) - 5000,max(coords[,1]) + 5000,min(coords[,2]) - 5000,max(coords[,2]) + 5000)
 
+studyExtent_buffer <- buffer(studyExtent, width = 5000)
 LCM <- crop(LCM, studyExtent_buffer)
-
 LCM=aggregate(LCM,fact=4,fun="modal")
-# add why choose fact=4
 
-## create the background points----
-set.seed(11)
 
+#### -----------------  create dataset for 1 -----------------  ####
 back = spatSample(
   studyExtent,
-  size=2500,
-  method="random") 
+  size=1000,
+  method="random")
+# draw ----
+par(mar = c(5, 5, 3, 5))
 
-plot(LCM)                          # 先画底图（栅格）
-plot(scot,col='white', add=TRUE)
-plot(back, add=TRUE, col="blue", pch=16, cex=0.5)   # 再画背景点
-plot(MelesmelesFin, add=TRUE, col="red", pch=16, cex=0.5) # 最后画出现点
+plot(LCM, col = hcl.colors(20, "Viridis"))
+
+plot(scot,
+     add = TRUE,
+     col = adjustcolor("white", alpha.f = 0.3), 
+     border = "white",
+     lty = 2,
+     lwd = 2)
+
+plot(back, add=TRUE,
+     col = adjustcolor("grey", alpha.f = 0.9),
+     pch = 16,
+     cex = 0.4)
+
+plot(Melesmeles_sp, add=TRUE,
+     col = "orange",
+     pch = 16,
+     cex = 0.5)
+
+legend(x = 220000, y = 690000, 
+       legend = c("Background", "Presence"),
+       col = c(adjustcolor("lightblue", alpha.f = 0.9), "orange"),
+       pch = 16,
+       pt.cex = c(0.6, 0.8),
+       bty = "o",       
+       bg = "white")   
+
+# 标题
+title("Distribution of Meles meles in Scotland")
+
 
 
 # 1.3 choose feature ----
 
 # extract infor
 eA_1<-extract(LCM,back)
-eP_1<-extract(LCM,MelesmelesFin)
+eP_1<-extract(LCM,Melesmeles_sp)
 
 # get frequency
 table(eA_1[,2])
@@ -292,72 +345,62 @@ legend("topright",
        legend = c("Presence > Background", "Presence < Background"),
        fill = c("#2E8B57", "#A0522D"),
        bty = "n",
-       cex = 0.9)
-
-
+       cex = 0.9,
+       y.intersp = 1.5)
 
 
 #### ----------------- 2 create dataset -----------------  ####
 
-Abs<-data.frame(crds(back),Pres=0)
-Pres<-data.frame(crds(MelesmelesFin),Pres=1)
-
-MelesmelesData<-rbind(Pres,Abs)
-MelesmelesData_sf=st_as_sf(MelesmelesData,coords=c("x","y"),crs="EPSG:27700")
-
-## 2.1 Calculate environment variables ----
-LCM<-as.factor(LCM)
-
-# restricted area:Mountain, heath, bog
+## definite reclass ----
+# restrict
 reclassrestrict = c(rep(0,9),rep(1,4),rep(0,9))
-restrict = reclass_binary(LCM, reclassrestrict)
-
 # Broadleaved
 reclassBroadleaved = c(0,1,rep(0,20))
-Broadleaved = reclass_binary(LCM, reclassBroadleaved)
-plot(Broadleaved)
-
 # Coniferouswoodland
 reclassConiferous = c(0,0,1,rep(0,19))
-Coniferous = reclass_binary(LCM, reclassConiferous)
-plot(Coniferous)
-
 # Arable and horticulture
 reclassArable = c(rep(0,3),1,rep(0,18))
-Arable = reclass_binary(LCM, reclassArable)
-
 # Improved grassland
 reclassImpgrass = c(rep(0,4),1,rep(0,17))
-Impgrass = reclass_binary(LCM, reclassImpgrass)
-
 # Acid grassland
 reclassAcidgrass = c(rep(0,7),1,rep(0,14))
-Acidgrass = reclass_binary(LCM, reclassAcidgrass)
 
+## 2.1 Calculate environment variables ----
+ 
+restrict = reclass_binary(LCM, reclassrestrict)
+Broadleaved = reclass_binary(LCM, reclassBroadleaved)
+Coniferous = reclass_binary(LCM, reclassConiferous)
+Arable = reclass_binary(LCM, reclassArable)
+Impgrass = reclass_binary(LCM, reclassImpgrass)
+Acidgrass = reclass_binary(LCM, reclassAcidgrass)
 
 ## 2.2 buffer ----
 
+Abs<-data.frame(crds(back),Pres=0)
+Pres<-data.frame(crds(Melesmeles_sp),Pres=1)
+
+# bind the two data frames by row (both dataframes have the same column headings)
+MelesmelesData<-rbind(Pres,Abs)
+MelesmelesData_sf=st_as_sf(MelesmelesData,coords=c("x","y"),crs="EPSG:27700")
+
+
 # Broadleaved# ----
-radii_Broadleaved<-seq(300,3000,by=300)
+radii_Broadleaved<-seq(100,2500,by=100)
 resList_Broadleaved=list()
 
 for(i in radii_Broadleaved){
   res.i=landBuffer(speciesData=MelesmelesData_sf,r=i,landcover=Broadleaved)
-  resList_Broadleaved[[i/200]]=res.i
-  print(i)
-}
+  resList_Broadleaved[[i/100]]=res.i
+  print(i)}
 glmRes_Broadleaved <- Test_GLM(
   resList = resList_Broadleaved,
   speciesData = MelesmelesData,
   radii = radii_Broadleaved
 )
-plot(glmRes_Broadleaved$radius, glmRes_Broadleaved$loglikelihood, type = "b", frame = FALSE, pch = 19, 
-     col = "red", xlab = "buffer", ylab = "logLik")
-glmRes_Broadleaved
 
 
 # Arable and horticulture ----
-radii_Arable<-seq(500,2000,by=100)
+radii_Arable<-seq(1000,10000,by=1000)
 resList_Arable=list()
 
 for(i in radii_Arable){
@@ -370,13 +413,10 @@ glmRes_Arable <- Test_GLM(
   speciesData = MelesmelesData,
   radii = radii_Arable
 )
-plot(glmRes_Arable$radius, glmRes_Arable$loglikelihood, type = "b", frame = FALSE, pch = 19, 
-     col = "red", xlab = "buffer", ylab = "logLik")
-glmRes_Arable
 
 
 # Improved grassland# ----
-radii_Impgrass<-seq(200,1800,by=100)
+radii_Impgrass<-seq(100,1800,by=100)
 resList_Impgrass=list()
 
 for(i in radii_Impgrass){
@@ -389,13 +429,10 @@ glmRes_Impgrass <- Test_GLM(
   speciesData = MelesmelesData,
   radii = radii_Impgrass
 )
-plot(glmRes_Impgrass$radius, glmRes_Impgrass$loglikelihood, type = "b", frame = FALSE, pch = 19, 
-     col = "red", xlab = "buffer", ylab = "logLik")
-glmRes_Impgrass
 
 
 # Acid grassland# ----
-radii_Acidgrass<-seq(400,2400,by=200)
+radii_Acidgrass<-seq(400,3000,by=200)
 resList_Acidgrass=list()
 
 for(i in radii_Acidgrass){
@@ -408,9 +445,6 @@ glmRes_Acidgrass <- Test_GLM(
   speciesData = MelesmelesData,
   radii = radii_Acidgrass
 )
-plot(glmRes_Acidgrass$radius, glmRes_Acidgrass$loglikelihood, type = "b", frame = FALSE, pch = 19, 
-     col = "red", xlab = "buffer", ylab = "logLik")
-glmRes_Acidgrass
 
 
 # restrict# ----
@@ -427,11 +461,49 @@ glmRes_restrict <- Test_GLM(
   speciesData = MelesmelesData,
   radii = radii_restrict
 )
-plot(glmRes_restrict$radius, glmRes_restrict$loglikelihood, type = "b", frame = FALSE, pch = 19, 
-     col = "red", xlab = "buffer", ylab = "logLik")
 
+# draw ----
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+ylim_all <- range(c(glmRes_restrict$loglikelihood,
+                    glmRes_Acidgrass$loglikelihood,
+                    glmRes_Arable$loglikelihood,
+                    glmRes_Broadleaved$loglikelihood))
+
+plot_fun <- function(res, title){
+  
+  res <- res[is.finite(res$loglikelihood), ]
+  
+  best_idx <- which.max(res$loglikelihood)
+  best_r   <- res$radius[best_idx]
+  best_ll  <- res$loglikelihood[best_idx]
+  
+  plot(res$radius, res$loglikelihood,
+       type = "b",
+       pch = 16,
+       col = "#2C7BB6",
+       lwd = 2,
+       xlab = "Buffer (m)",
+       ylab = "logLik",
+       main = title)
+  
+  points(best_r, best_ll, col = "red", pch = 19, cex = 1.2)
+  abline(v = best_r, lty = 2, col = "red")
+  abline(h = best_ll, lty = 2, col = "grey60")
+  
+  text(best_r, best_ll,
+       labels = paste0(" ", best_r, " m"),
+       pos = 4,
+       cex = 0.8,
+       col = "red")
+}
+
+plot_fun(glmRes_restrict, "Restrict")
+plot_fun(glmRes_Acidgrass, "Acid grassland")
+plot_fun(glmRes_Impgrass, "Improved grassland")
+plot_fun(glmRes_Broadleaved, "Broadleaved woodland")
+
+summary(glmRes_restrict$loglikelihood)
 #Landscape proportion (moving window) ----
-
 
 lcm_restrict  = calc_prop_focal(restrict, glmRes_restrict$radius[which.max(glmRes_restrict$loglikelihood)])
 lcm_Acidgrass  = calc_prop_focal(Acidgrass, glmRes_Acidgrass$radius[which.max(glmRes_Acidgrass$loglikelihood)])
@@ -443,385 +515,479 @@ glmRes_Acidgrass$radius[which.max(glmRes_Acidgrass$loglikelihood)]
 glmRes_Impgrass$radius[which.max(glmRes_Impgrass$loglikelihood)]
 glmRes_Broadleaved$radius[which.max(glmRes_Broadleaved$loglikelihood)]
 
-#Arable
-dist_raster <- distance(Arable, target = 0)
-dist_raster <- mask(dist_raster, Arable)
-Arable_dist <- exp(-dist_raster / 5000)
-plot(Arable_dist)
+#Arable ----
+par(mfrow = c(1,2))
+
+target <- Arable
+target[target == 0] <- NA 
+dist_raster <- distance(target)
+Arable_dist <- exp(-sqrt(dist_raster) / 300)
+par(mfrow = c(1,2), mar = c(4,4,3,5))
+
+plot(dist_raster,
+     main = "(a) Distance to arable land",
+     col = hcl.colors(50, "Viridis"),
+     axes = FALSE,
+     box = FALSE)
+
+plot(Arable_dist,
+     main = "(b) Distance-decay effect",
+     col = hcl.colors(50, "Viridis"),
+     axes = FALSE,
+     box = FALSE)
+
 
 demScot=terra::resample(demScot,lcm_restrict)
 
-# 2.1 add all environment variables ----
-allEnv=c(lcm_Acidgrass,lcm_Impgrass,lcm_restrict,lcm_Broadleaved,Arable_dist,demScot)
-names(allEnv)=c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')
+lcm_Acidgrass   <- mask(lcm_Acidgrass, demScot)
+lcm_Impgrass    <- mask(lcm_Impgrass, demScot)
+lcm_restrict    <- mask(lcm_restrict, demScot)
+lcm_Broadleaved <- mask(lcm_Broadleaved, demScot)
+Arable_dist     <- mask(Arable_dist, demScot)
 
-# 2.2 ‘presence’ and ‘background’ -----
+par(mfrow = c(3,2), mar = c(3,3,3,4))
 
-back_sf=st_as_sf(back,crs="EPSG:27700")
-Melesmeles_sf = st_as_sf(
-  MelesmelesFin,
-  coords = c("x", "y"),
-  crs="EPSG:27700"
+scale01 <- function(x){
+  (x - min(values(x), na.rm=TRUE)) /
+    (max(values(x), na.rm=TRUE) - min(values(x), na.rm=TRUE))
+}
+
+vars <- list(
+  scale01(lcm_Acidgrass),
+  scale01(lcm_Impgrass),
+  scale01(lcm_restrict),
+  scale01(lcm_Broadleaved),
+  scale01(Arable_dist),
+  scale01(demScot)
 )
-## organize ‘presence’ and ‘background’----
 
-# extract env var for presence point
-eP=terra::extract(allEnv,Melesmeles_sf)
-eB=terra::extract(allEnv,back_sf)
-# env var + presence point 
-Pres.cov=st_as_sf(cbind(eP,Melesmeles_sf))
-Back.cov=st_as_sf(cbind(eB,back_sf))
-
-## add text for differencr point ----
-
-# add text for presence point (MelesmelesFin)
-Pres.cov$Pres=1
-# delet ID
-Pres.cov=Pres.cov[,-1]
-
-# add text for background point
-Back.cov$Pres=0
-Back.cov = Back.cov[,-1]
-
-# 2.3 merging data ----
-
-## merging point coordinates ----
-# get coordinate
-coordsPres=st_coordinates(Pres.cov)
-coordsBack=st_coordinates(back_sf)
-
-# merging point coordinates
-coords=data.frame(rbind(coordsPres,coordsBack))
-colnames(coords)=c("x","y")
-names(Pres.cov)
-names(Back.cov)
-all.cov=rbind(Pres.cov,Back.cov)
-all.cov=cbind(all.cov,coords)
+titles <- c("(a) Acid grassland",
+            "(b) Improved grassland",
+            "(c) Study area",
+            "(d) Broadleaved woodland",
+            "(e) Arable (decay)",
+            "(f) Elevation")
 
 
-## data cleaning ----
-all.cov=na.omit(all.cov)
-all.cov=st_drop_geometry(all.cov)
+for(i in 1:6){
+  plot(vars[[i]],
+       main = titles[i],
+       col = hcl.colors(50, "Viridis"),
+       zlim = c(0,1),
+       axes = FALSE,
+       box = FALSE)
+}
 
+# 2.1 add all environment variables ----
+
+lcm_Acidgrass = scale01(lcm_Acidgrass)
+lcm_Impgrass = scale01(lcm_Impgrass)
+lcm_restrict = scale01(lcm_restrict)
+lcm_Broadleaved = scale01(lcm_Broadleaved)
+Arable_dist = scale01(Arable_dist)
+demScot = scale01(demScot)
+
+ml_data = create_dataset(c(lcm_Acidgrass,lcm_Impgrass,lcm_restrict,lcm_Broadleaved,Arable_dist,demScot),
+                         c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem'),
+                         Melesmeles_sp,back)
 
 # 2.4 VIF validation ----
 
-vif_model <- lm(Pres ~ Acidgrass + Impgrass + restrict + Broadleaved + Arable + dem, data = all.cov)
+vif_model <- lm(Pres ~ Acidgrass + Impgrass + restrict + Broadleaved + Arable + dem, data = ml_data)
 vif(vif_model)
-cor(all.cov[, c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')])
-str(all.cov)
 
+# draw ----
+dev.off()
 
-# PCA
-vars <- all.cov[, c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')]
-pca <- prcomp(vars, scale. = TRUE)
+par(mar = c(5,5,3,2))
 
-pc_data <- as.data.frame(pca$x)
+cor_mat <- cor(ml_data[, c('Acidgrass','Impgrass','restrict',
+                           'Broadleaved','Arable','dem')],
+               use = "complete.obs")
 
-pca$rotation
-summary(pca)
+col_fun <- colorRampPalette(c("#3B4CC0", "white", "#B40426"))
 
-####----------------- 3 define parameters ----------------- ####
+n <- ncol(cor_mat)
 
-# 3.1 Create category task ----
-pc_data$Pres <- as.factor(all.cov$Pres)
-pc_data$x <- all.cov$x
-pc_data$y <- all.cov$y
+image(1:n, 1:n, cor_mat,
+      col = col_fun(100),
+      axes = FALSE,
+      xlab = "", ylab = "",
+      zlim = c(-1,1))
 
-task = makeClassifTask(
-  data = pc_data[, c("PC1", "PC2", "PC3","Pres")],
-  target = "Pres",
-  positive = "1",
-  coordinates = pc_data[, c("x", "y")])
+axis(1, at = 1:n, labels = FALSE)
+text(1:n, par("usr")[3] - 0.2,  
+     labels = colnames(cor_mat),
+     srt = 45, adj = 1, xpd = TRUE, cex = 0.8)
 
-# 3.2 Define the cross-validation strategy ----
+axis(2, at = 1:n,
+     labels = colnames(cor_mat),
+     las = 2, cex.axis = 0.8)
 
-# Randomly shuffle all points, disregarding spatial location
-perf_levelCV = makeResampleDesc(
-  method = "RepCV",
-  predict = "test",
-  folds = 5,
-  reps = 5)
+abline(h = 1:(n+1)-0.5, col = "grey90")
+abline(v = 1:(n+1)-0.5, col = "grey90")
 
-# Training and test points are spatially separated.
-# Evaluate the model's predictive ability in "unsampled regions"
-perf_level_spCV = makeResampleDesc(
-  method = "SpRepCV",
-  folds = 5, 
-  reps = 5) 
-
-
-
-####----------------- 4 Binomial ----------------- ####
-
-# 4.1 define Binomial (logistic regression) ----
-lrnBinomial = makeLearner(
-  "classif.binomial",      #Classification model of binomial distribution
-  predict.type = "prob",
-  fix.factors.prediction = TRUE)
-
-
-# 4.2 validation ----
-cvBinomial = mlr::resample(
-  learner = lrnBinomial,
-  task =task,
-  resampling = perf_levelCV, 
-  measures = mlr::auc,
-  show.info = FALSE)
-
-print(cvBinomial)
-
-sp_cvBinomial = mlr::resample(
-  learner = lrnBinomial,
-  task =task,
-  resampling = perf_level_spCV, 
-  measures = mlr::auc,
-  models = TRUE,
-  keep.pred = TRUE)
-pred <- sp_cvBinomial$pred
-e <- evaluate(pred$data$prob.1[pred$data$truth == 1],
-              pred$data$prob.1[pred$data$truth == 0])
-
-print(sp_cvBinomial)
-plot(e, "ROC")
-
-sp_cvBinomial = mlr::resample(
-  learner = lrnBinomial,
-  task =task,
-  resampling = perf_level_spCV, 
-  measures = mlr::auc,
-  models = TRUE,
-  keep.pred = TRUE)
-pred <- sp_cvBinomial$pred
-e <- evaluate(pred$data$prob.1[pred$data$truth == 1],
-              pred$data$prob.1[pred$data$truth == 0])
-
-print(sp_cvBinomial)
-plot(e, "ROC")
-
-roc_obj <- roc(
-  response = pred$data$truth,
-  predictor = pred$data$prob.1   # 注意类别名称
-)
-
-plot(roc_obj, col = "blue", lwd = 2)
-
-print(sp_cvBinomial)
-
-
-# 4.3 make partition plots----
-
-plots = createSpatialResamplingPlots(
-  task,
-  resample=cvBinomial,
-  crs=crs(allEnv),
-  datum=crs(allEnv),
-  color.test = "red",
-  point.size = 1)
-
-plotsSP = createSpatialResamplingPlots(
-  task,
-  resample=sp_cvBinomial,
-  crs=crs(allEnv),
-  datum=crs(allEnv),
-  color.test = "red",
-  point.size = 1)
-
-plots = createSpatialResamplingPlots(
-  task,
-  resample=cvBinomial,
-  crs=crs(allEnv),
-  datum=crs(allEnv),
-  color.test = "red",
-  point.size = 1)
-
-library(cowplot)
-cowplot::plot_grid(plotlist = plots[["Plots"]], ncol = 3, nrow = 2,
-                   labels = plots[["Labels"]])
-
-
-
-
-
-####----------------- 5 Random Forest ----------------- ####
-
-# 5.1 define Random Forest ----
-lrnRF = makeLearner(
-  "classif.ranger",
-  predict.type = "prob",
-  fix.factors.prediction = TRUE)
-
-
-# 5.2 Random Forest validation----
-cvRF = mlr::resample(
-  learner = lrnRF,
-  task =task,
-  resampling = perf_levelCV, 
-  measures = mlr::auc,
-  show.info = FALSE)
-
-print(cvRF)
-
-sp_cvRF = mlr::resample(
-  learner = lrnRF, 
-  task =task,
-  resampling = perf_level_spCV, 
-  measures = mlr::auc,
-  show.info = FALSE)
-
-print(sp_cvRF)
-
-
-
-
-# 5.3 Random Forest Parameter Tuning----
-getParamSet(lrnRF)
-# Parameter tuning command
-paramsRF = makeParamSet(
-  makeIntegerParam("mtry",lower = 1,upper = 3),
-  makeIntegerParam("min.node.size",lower = 1,upper = 20),
-  makeIntegerParam("num.trees",lower = 100,upper = 500)
-)
-# Parameter Tuning Evaluation Method
-tune_level = makeResampleDesc(method = "SpCV", iters = 5)
-# Parameter search method
-ctrl = makeTuneControlRandom(maxit = 50)
-
-tuned_RF = tuneParams(learner = lrnRF,
-                      task = task,
-                      resampling = tune_level,
-                      measures = mlr::auc,
-                      par.set = paramsRF,
-                      control = ctrl,
-                      show.info = FALSE)
-
-print(tuned_RF)
-
-
-
-####----------------- 6 MaxEnt ----------------- ####
-
-# 6.1 spacial grid ----
-area_grid = st_make_grid(
-  MelesmelesFin,
-  c(50000, 50000),
-  what = "polygons",
-  square = T)
-
-area_grid_sf=st_as_sf(area_grid)
-area_grid_sf$grid_id=1:length(lengths(area_grid))
-
-# plot and check
-plot(area_grid_sf$x)
-plot(Melesmeles_sf$geometry,add=T)
-
-# define spacial folds
-folds=area_grid_sf$grid_id
-
-# Unified coordinate system
-dataPoints=st_as_sf(all.cov,coords = c("x","y"))
-st_crs(dataPoints)=crs(area_grid_sf)
-
-# num for fold
-folds=5
-
-# presence and background
-### why do this ???
-Pres.cov=all.cov[all.cov$Pres==1,]
-Back.cov=all.cov[all.cov$Pres==0,]
-
-kfold_pres = kfold(Pres.cov, folds)
-kfold_back = kfold(Back.cov, folds)
-
-
-# 6.2 cross-validation ----
-# AUC list
-eMax=list()
-
-for (i in 1:folds) {
-  # get train and test data
-  train = Pres.cov[kfold_pres!= i,]
-  test = Pres.cov[kfold_pres == i,]
-  
-  backTrain=Back.cov[kfold_back!=i,]
-  backTest=Back.cov[kfold_back==i,]
-  
-  dataTrain=rbind(train,backTrain)
-  dataTest=rbind(test,backTest)
-  
-  # training
-  maxnetMod=maxnet(dataTrain$Pres, dataTrain[,1:4])
-  # evaluate on test data（AUC）
-  eMax[[i]] = evaluate(p=dataTest[ which(dataTest$Pres==1),],a=dataTest[which(dataTest$Pres==0),],maxnetMod)
+for(i in 1:n){
+  for(j in 1:n){
+    val <- round(cor_mat[i,j],2)
+    
+    text(i, j, val,
+         col = ifelse(abs(val) > 0.5, "white", "black"),
+         cex = 0.8)
+  }
 }
 
-# get all AUC
-aucMax = sapply(eMax, function(x){slot(x, 'auc')} )
-
-print(mean(aucMax))
+title("Correlation matrix", cex.main = 1.1)
 
 
-# 6.3 spatial cross-validation ----
+# +++++++++++++++++++ +++++++++++++++++++  +++++++++++++++++++ # +++++++++++++++++++# +++++++++++++++++++
+# spacial grid ----
+# make a grid for spatial blocking
+scot_union <- st_union(scot)
 
-# Use grid IDs as folds for spatial partitioning
+grid_sf <- st_as_sf(st_make_grid(scot_union,
+                                 #what = "polygons", square = T,
+                                 n = c(2,3)))
+grid_sf$grid_id <- 1:nrow(grid_sf)
+
+area_grid_sf <- st_intersection(grid_sf,st_geometry(scot_union))
+
+area_grid_sf <- st_as_sf(area_grid_sf)
+area_grid_sf$grid_id <- 1:nrow(area_grid_sf)
+
+# plot----
+plot(st_geometry(area_grid_sf),
+     col = NA,
+     border = "grey40",
+     lwd = 1)
+centroids = st_centroid(area_grid_sf)
+
+text(st_coordinates(centroids),labels = area_grid_sf$grid_id,
+     cex = 1.5,
+     col = "red")
+
+plot(Melesmeles_sp,add = TRUE,pch = 1,         
+     col = "black",
+     cex = 0.7)
+
+dataPoints=st_as_sf(ml_data,coords = c("x","y"))
+st_crs(dataPoints)=crs(area_grid_sf)
+
+
 folds = area_grid_sf$grid_id
+vars  = c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')
 
-# Initialize list to store AUC results for each fold
-maxEvalList = list()
-
+# maxtent_data----
+library(precrec)
+maxEvalList=list()
+mm_list = list() 
 for (i in folds) {
   
-  # Define training area (all grids except the current one)
+  
+  gridTrain=subset(area_grid_sf,area_grid_sf$grid_id!=i)
+  
+  train=data.frame(st_drop_geometry(st_intersection(gridTrain, dataPoints)))
+  
+
+  gridTest=subset(area_grid_sf,area_grid_sf$grid_id==i)
+  
+  
+  test=data.frame(st_drop_geometry(st_intersection(gridTest, dataPoints)))  
+  
+  
+  maxnetMod=maxnet(train$Pres, train[,vars],
+                   classes="lq")   
+  
+  
+  pred=predict(maxnetMod, test,type="cloglog")
+  mm = evalmod(scores = pred, labels = test$Pres)
+  mm_list[[i]] = mm
+  precrec_proc=evalmod(scores = pred,labels = test$Pres,mode = "prcroc")
+  
+  modauc=precrec::auc(precrec::evalmod(scores = pred, 
+                                       labels = test$Pres))
+  
+  maxEvalList[[i]]=modauc$aucs[1]
+  print(i)
+  
+}
+maxEvalList
+mean(unlist(maxEvalList))
+
+par(mfrow = c(2,3),
+    mar = c(4,4,3,1),
+    bg = "white")
+
+for (i in seq_along(mm_list)) {
+  
+  mm <- mm_list[[i]]
+  auc_val <- precrec::auc(mm)$aucs[1]
+  
+  x <- mm$roc[[1]]$x
+  y <- mm$roc[[1]]$y
+  
+  plot(0, 0,
+       type = "n",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       xlab = "False positive rate",
+       ylab = "True positive rate",
+       main = paste0("AUC= ", round(auc_val, 3)),
+       panel.first = {
+         rect(0, 0, 1, 1, col = "white", border = NA)
+         abline(0, 1, col = "black", lwd = 1)
+       })
+  
+  # 红点
+  points(x, y, col = "red", pch = 1)
+}
+
+# glm ----
+glmEvalList = list()
+mg_list = list() 
+for (i in folds) {
+  
   gridTrain = subset(area_grid_sf, area_grid_sf$grid_id != i)
+  train = data.frame(st_drop_geometry(st_intersection(gridTrain, dataPoints)))
   
-  # Extract training points by spatial intersection with training grids
-  # and remove geometry to create a data frame
-  train = data.frame(
-    st_drop_geometry(
-      st_intersection(gridTrain, dataPoints)
-    )
-  )
-  
-  # Define test area (current grid only)
   gridTest = subset(area_grid_sf, area_grid_sf$grid_id == i)
+  test = data.frame(st_drop_geometry(st_intersection(gridTest, dataPoints)))  
   
-  # Extract test points within the test grid
-  test = data.frame(
-    st_drop_geometry(
-      st_intersection(gridTest, dataPoints)
-    )
-  )  
+  train$Pres = as.numeric(train$Pres)
+  test$Pres  = as.numeric(test$Pres)
   
-  # Train MaxEnt model (maxnet)
-  # train$Pres: presence/absence response
-  # train[1:4]: predictor variables
-  # classes = "lq": linear and quadratic features
-  maxnetMod = maxnet(train$Pres, train[1:4],
-                     classes = "lq")   
-  
-  # Predict on test data (cloglog scale gives occurrence probability)
-  pred = predict(maxnetMod, test, type = "cloglog")
-  
-  # Evaluate model performance (ROC and PR curves)
-  precrec_proc = evalmod(scores = pred,
-                         labels = test$Pres,
-                         mode = "prcroc")
-  
-  # Calculate AUC value
-  modauc = precrec::auc(
-    precrec::evalmod(scores = pred, 
-                     labels = test$Pres)
+  form = as.formula(
+    paste("Pres ~", paste(vars, collapse = " + "))
   )
   
-  # Store AUC of current fold
-  maxEvalList[[i]] = modauc$aucs[1]
+  glmMod = glm(
+    form,
+    data = train,
+    family = binomial(link = "logit")
+  )
   
-  # Print current fold ID (progress tracking)
+  pred = predict(glmMod, test[, vars], type = "response")
+  mg = evalmod(scores = pred, labels = test$Pres)
+  mg_list[[i]] = mg
+  precrec_proc = evalmod(scores = pred, labels = test$Pres, mode = "prcroc")
+  
+  modauc = precrec::auc(
+    precrec::evalmod(scores = pred, labels = test$Pres)
+  )
+  
+  glmEvalList[[i]] = modauc$aucs[1]
+  
   print(i)
 }
 
-# Compute mean AUC across all spatial folds
-mean(unlist(maxEvalList))
+glmEvalList
+mean(unlist(glmEvalList))
+
+library(ranger)
+par(mfrow = c(2,3),
+    mar = c(4,4,3,1),
+    bg = "white")
+
+for (i in seq_along(mg_list)) {
+  
+  mg <- mg_list[[i]]
+  auc_val <- precrec::auc(mg)$aucs[1]
+  
+  x <- mm$roc[[1]]$x
+  y <- mm$roc[[1]]$y
+  
+  plot(0, 0,
+       type = "n",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       xlab = "False positive rate",
+       ylab = "True positive rate",
+       main = paste0("AUC= ", round(auc_val, 3)),
+       panel.first = {
+         rect(0, 0, 1, 1, col = "white", border = NA)
+         abline(0, 1, col = "black", lwd = 1)
+       })
+  
+  points(x, y, col = "red", pch = 1)
+}
+
+# rf ----
+rfEvalList = list()
+rf_list = list() 
+for (i in folds) {
+  
+  gridTrain = subset(area_grid_sf, area_grid_sf$grid_id != i)
+  train = data.frame(st_drop_geometry(st_intersection(gridTrain, dataPoints)))
+  
+  gridTest = subset(area_grid_sf, area_grid_sf$grid_id == i)
+  test = data.frame(st_drop_geometry(st_intersection(gridTest, dataPoints)))  
+  
+  train$Pres = as.factor(train$Pres)
+  test$Pres  = as.factor(test$Pres)
+  
+  mtry_grid = c(2, 3, 4, length(vars))
+  min_node_grid = c(1, 5, 10)
+  
+  best_auc = -Inf
+  best_model = NULL
+  
+  # ---单grid search ---
+  for (m in mtry_grid) {
+    for (n in min_node_grid) {
+      
+      rfMod = ranger(
+        formula = as.formula(
+          paste("Pres ~", paste(vars, collapse = " + "))
+        ),
+        data = train,
+        probability = TRUE,
+        mtry = m,
+        min.node.size = n,
+        num.trees = 500,
+        importance = "impurity"
+      )
+      
+      pred_train = predict(rfMod, train[, vars])$predictions[,2]
+      
+      auc_tmp = precrec::auc(
+        precrec::evalmod(scores = pred_train, labels = as.numeric(as.character(train$Pres)))
+      )$aucs[1]
+      
+      if (auc_tmp > best_auc) {
+        best_auc = auc_tmp
+        best_model = rfMod
+      }
+    }
+  }
+  
+  pred = predict(best_model, test[, vars])$predictions[,2]
+  rf = evalmod(scores = pred, labels = test$Pres)
+  rf_list[[i]] = rf
+  test_num = as.numeric(as.character(test$Pres))
+  
+  precrec_proc = evalmod(scores = pred, labels = test_num, mode = "prcroc")
+  
+  modauc = precrec::auc(
+    precrec::evalmod(scores = pred, labels = test_num)
+  )
+  
+  rfEvalList[[i]] = modauc$aucs[1]
+  
+  print(paste("Fold:", i, "AUC:", modauc$aucs[1]))
+}
+
+rfEvalList
+mean(unlist(rfEvalList))
+
+par(mfrow = c(2,3),
+    mar = c(4,4,3,1),
+    bg = "white")
+
+for (i in seq_along(rf_list)) {
+  
+  rf <- rf_list[[i]]
+  auc_val <- precrec::auc(rf)$aucs[1]
+  
+  x <- rf$roc[[1]]$x
+  y <- rf$roc[[1]]$y
+  
+  plot(0, 0,
+       type = "n",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       xlab = "False positive rate",
+       ylab = "True positive rate",
+       main = paste0("AUC= ", round(auc_val, 3)),
+       panel.first = {
+         rect(0, 0, 1, 1, col = "white", border = NA)
+         abline(0, 1, col = "black", lwd = 1)
+       })
+  
+  points(x, y, col = "red", pch = 1)
+}
+
+
+# glmpca ----
+glmpcaEvalList = list()
+glmpca_list = list() 
+for (i in folds) {
+  
+  gridTrain = subset(area_grid_sf, area_grid_sf$grid_id != i)
+  train = data.frame(st_drop_geometry(st_intersection(gridTrain, dataPoints)))
+  
+  gridTest = subset(area_grid_sf, area_grid_sf$grid_id == i)
+  test = data.frame(st_drop_geometry(st_intersection(gridTest, dataPoints)))  
+  
+  train$Pres = as.numeric(train$Pres)
+  test$Pres  = as.numeric(test$Pres)
+  
+  pca_mod = prcomp(train[, vars], scale. = TRUE)
+  
+  var_exp = summary(pca_mod)$importance[2,]
+  
+  k = which(cumsum(var_exp) >= 0.9)[1]
+  
+  train_pca = as.data.frame(pca_mod$x[, 1:k])
+  
+  test_pca = as.data.frame(
+    predict(pca_mod, newdata = test[, vars])[, 1:k]
+  )
+  
+  train_pca$Pres = train$Pres
+  test_pca$Pres  = test$Pres
+  
+  form = as.formula(
+    paste("Pres ~", paste(colnames(train_pca)[-ncol(train_pca)], collapse = "+"))
+  )
+  
+  glmMod = glm(
+    form,
+    data = train_pca,
+    family = binomial(link = "logit")
+  )
+  
+  pred = predict(glmMod, test_pca, type = "response")
+  glmpca = evalmod(scores = pred, labels = test$Pres)
+  glmpca_list[[i]] = glmpca
+  precrec_proc = evalmod(scores = pred, labels = test_pca$Pres, mode = "prcroc")
+  
+  modauc = precrec::auc(
+    precrec::evalmod(scores = pred, labels = test_pca$Pres)
+  )
+  
+  glmpcaEvalList[[i]] = modauc$aucs[1]
+  
+  print(paste("Fold:", i, "PCs:", k, "AUC:", modauc$aucs[1]))
+}
+
+glmpcaEvalList
+mean(unlist(glmpcaEvalList))
+par(mfrow = c(2,3),
+    mar = c(4,4,3,1),
+    bg = "white")
+
+for (i in seq_along(glmpca_list)) {
+  
+  glmpca <- glmpca_list[[i]]
+  auc_val <- precrec::auc(glmpca)$aucs[1]
+  
+  x <- glmpca$roc[[1]]$x
+  y <- glmpca$roc[[1]]$y
+  
+  plot(0, 0,
+       type = "n",
+       xlim = c(0,1),
+       ylim = c(0,1),
+       xlab = "False positive rate",
+       ylab = "True positive rate",
+       main = paste0("AUC= ", round(auc_val, 3)),
+       panel.first = {
+         rect(0, 0, 1, 1, col = "white", border = NA)
+         abline(0, 1, col = "black", lwd = 1)
+       })
+  
+  points(x, y, col = "red", pch = 1)
+}
 
 
 
@@ -831,59 +997,47 @@ mean(unlist(maxEvalList))
 ### 7.1 Calculate Model Weights (Based on Spatial CV AUC) ----
 # Extract AUC from spatial cross-validation results
 auc_values <- c(
-  binomial = as.numeric(sp_cvBinomial$aggr),
-  rf       = as.numeric(sp_cvRF$aggr),
-  maxent   = mean(unlist(maxEvalList))
+  binomial = mean(unlist(glmEvalList)),
+  rf       = mean(unlist(rfEvalList)),
+  maxent   = mean(unlist(maxEvalList)))
+
+weights <- auc_values / sum(auc_values)
+form
+names(ml_data)
+vars  = c('Acidgrass','Impgrass','restrict','Broadleaved','Arable','dem')
+form <- as.formula(
+  paste("Pres ~", paste(vars, collapse = " + "))
 )
 
-# Normalize weights so they sum to 1
-weights <- auc_values / sum(auc_values)
-print("Model Weights:")
-print(weights)
+fit_glm    <- glm(form, data = ml_data, family = binomial)
+fit_rf     <- best_model
+fit_maxent <- maxnet(ml_data$Pres, ml_data[,vars], classes = "lq")
+allEnv <- c(
+  lcm_Acidgrass,
+  lcm_Impgrass,
+  lcm_restrict,
+  lcm_Broadleaved,
+  Arable_dist,
+  demScot
+)
+names(allEnv) <- vars
+final_mask <- complete.cases(terra::values(allEnv))
+env_pred <- as.data.frame(terra::values(allEnv))
+env_pred <- env_pred[final_mask, ]
+env_pred <- env_pred[, vars]
+# 预测
 
-### 7.2 Train Final Models using Full Dataset ----
-# 1. Logistic Regression (GLM)
-lrnBinomial <- makeLearner("classif.binomial", predict.type = "prob", fix.factors.prediction = TRUE)
-fit_glm <- mlr::train(lrnBinomial, task)
-
-# 2. Random Forest (RF)
-lrnRF <- makeLearner("classif.ranger", predict.type = "prob", fix.factors.prediction = TRUE)
-if(exists("tuned_RF")) lrnRF <- setHyperPars(lrnRF, par.vals = tuned_RF$x)
-fit_rf <- mlr::train(lrnRF, task)
-
-# 3. MaxEnt
-pc_data$Pres <- as.numeric(as.character(pc_data$Pres))
-maxnet_data <- pc_data[, c("PC1", "PC2", "PC3")]
-maxnet_pres <- pc_data$Pres
-fit_maxent  <- maxnet(maxnet_pres, maxnet_data, classes = "lq")
-unique(pc_data$Pres)
-### 7.3 Prepare Environmental Data for Prediction ----
-
-allPC <- terra::predict(allEnv, pca, index = 1:3)
-names(allPC) <- c("PC1", "PC2", "PC3")
-
-plot(allPC)
-
-# PC to Dataframe
-env_df_all <- as.data.frame(allPC, xy = TRUE, na.rm = FALSE)
-pred_vars <- c("PC1", "PC2", "PC3")
-
-final_mask <- complete.cases(env_df_all[, pred_vars])
-env_pred <- env_df_all[final_mask, pred_vars]
-
-### 7.4 Generate Predictions ----
-# Predict probability for each model
-pred_glm    <- predict(fit_glm, newdata = env_pred)$data[, "prob.1"]
-pred_rf     <- predict(fit_rf, newdata = env_pred)$data[, "prob.1"]
+pred_glm    <- predict(fit_glm, newdata = env_pred, type = "response")
+pred_rf <- predict(fit_rf, data = env_pred)$predictions[,2]
 pred_maxent <- predict(fit_maxent, env_pred, type = "cloglog")
-
-### 7.5 Weighted Ensemble Calculation ----
-# Combine predictions using the AUC-based weights
-ensemble_vec <- (weights[1] * pred_glm) + 
-  (weights[2] * pred_rf) + 
-  (weights[3] * pred_maxent)
+env_pred <- as.data.frame(terra::values(allEnv))
+# ensemble
+ensemble_vec <- weights["binomial"] * pred_glm +
+  weights["rf"]       * pred_rf +
+  weights["maxent"]   * pred_maxent
 
 ### 7.6 Map Generation and Visualization ----
+dev.off
 # Create an empty raster template based on the original environment
 ensemble_raster <- rast(allEnv[[1]])
 values(ensemble_raster) <- NA
@@ -899,168 +1053,7 @@ plot(ensemble_raster,
      col = terrain.colors(100))
 
 # Overlay presence points to verify accuracy
-points(MelesmelesFin, pch = 20, col = "red", cex = 0.5)
+points(Melesmeles_sp, pch = 20, col = "red", cex = 0.6)
 
 
-####----------------- 8 Point Process Modelling ----------------- ####
-
-# 8.1 Data preprocessing ----
-## Prepare environmental covariates ----
-
-# Convert raster layers to 'im' objects (required by spatstat)
-foodIm    = raster.as.im(raster(allEnv$food))     
-urbanIm   = raster.as.im(raster(allEnv$urban))
-habitatIm = raster.as.im(raster(allEnv$habitat))
-demIm     = raster.as.im(raster(allEnv$dem))  
-
-
-## Define study window ----
-# Create study window based on the urban raster layer
-window.poly = as.owin(urbanIm)
-
-# Inspect the study window
-plot(window.poly)
-
-
-## Create point pattern object ----
-
-# Extract coordinates from occurrence data (sf object)
-MelesmelesCoords = st_coordinates(MelesmelesFin)
-
-# Create point pattern (ppp object)
-pppMelesmeles = ppp(MelesmelesCoords[,1],
-                    MelesmelesCoords[,2],
-                    window = window.poly)
-
-# Visual check: raster layer + point pattern
-plot(allEnv$food)
-plot(pppMelesmeles, add = TRUE)
-
-# Remove points located outside the study window
-pppMelesmeles = as.ppp(pppMelesmeles)
-
-
-## Rescale spatial units ----
-
-# Convert units from meters to kilometers (to improve numerical stability)
-pppMelesmeles = spatstat.geom::rescale(pppMelesmeles, 1000)
-
-# Ensure all covariate rasters are on the same spatial scale
-foodIm    = spatstat.geom::rescale(foodIm, 1000)
-urbanIm   = spatstat.geom::rescale(urbanIm, 1000)
-habitatIm = spatstat.geom::rescale(habitatIm, 1000)
-demIm     = spatstat.geom::rescale(demIm, 1000)
-
-
-
-# 8.2 Exploratory analysis: test Complete Spatial Randomness (CSR)----
-
-# Compute Ripley’s K-function with simulation envelopes
-Kcsr = envelope(pppMelesmeles,
-                Kest,
-                nsim = 39,
-                VARIANCE = TRUE,
-                nSD = 1,
-                global = TRUE)
-
-# Plot results to assess deviation from CSR
-plot(Kcsr, shade = c("hi", "lo"), legend = TRUE)
-
-
-
-# 8.3 Select quadrature scheme (background point density)----
-
-# Test different grid densities for quadrature scheme
-ndTry = seq(100, 1000, by = 100)
-
-for(i in ndTry){
-  
-  # Construct quadrature scheme (data points + dummy/background points)
-  Q.i = quadscheme(pppMelesmeles,
-                   method = "grid",
-                   nd = i)
-  
-  # Fit a simple Poisson point process model
-  fit.i = ppm(Q.i ~ foodIm + urbanIm + demIm + habitatIm)
-  
-  print(i)
-  
-  # Evaluate model fit using AIC
-  print(AIC(fit.i))
-}
-
-# Select optimal grid density (based on AIC)
-Q = quadscheme(pppMelesmeles, method = "grid", nd = 900)
-
-
-
-# 8.4 Explore covariate-response relationships ----
-
-# Non-parametric estimation of intensity vs environmental covariates
-plot(rhohat(pppMelesmeles, foodIm))    
-plot(rhohat(pppMelesmeles, demIm))     
-plot(rhohat(pppMelesmeles, urbanIm))   
-plot(rhohat(pppMelesmeles, habitatIm))  
-
-
-# 8.5 Fit Poisson Point Process Model (PPM)----
-
-# Fit inhomogeneous Poisson point process model
-# Polynomial terms are used to capture non-linear relationships
-# Spatial coordinates (x, y) account for large-scale spatial trends
-firstPPMod = ppm(Q ~ poly(foodIm, 3) +
-                   poly(habitatIm, 3) +
-                   poly(demIm, 2) +
-                   poly(urbanIm, 3) +
-                   x + y)
-
-# Model diagnostics using simulation envelope of K-function
-firstModEnv = envelope(firstPPMod,
-                       Kest,
-                       nsim = 39,
-                       VARIANCE = TRUE,
-                       nSD = 1,
-                       global = TRUE)
-
-plot(firstModEnv)
-
-
-
-# 8.6 Fit cluster point process model (kppm - Thomas process)----
-
-# Fit Thomas cluster process model to account for spatial aggregation
-thomasMod = kppm(Q ~ poly(foodIm) +
-                   poly(habitatIm) +
-                   poly(urbanIm) +
-                   x + y,
-                 "Thomas")
-
-# Evaluate model fit using K-function envelope
-thomasEnv = envelope(thomasMod,
-                     Kest,
-                     nsim = 39,
-                     VARIANCE = TRUE,
-                     nSD = 1,
-                     global = TRUE)
-
-plot(thomasEnv)
-
-
-
-# 8.7 Model evaluation and spatial prediction ----
-
-# Plot ROC curve
-plot(roc(thomasMod))
-
-# Calculate AUC (model discrimination ability)
-auc.kppm(thomasMod)
-
-# Predict spatial intensity (occurrence probability surface)
-prPPMod = predict(thomasMod)
-
-# Visualize prediction
-plot(prPPMod)
-
-# Convert prediction to raster format for GIS visualization
-plot(rast(prPPMod))
 
